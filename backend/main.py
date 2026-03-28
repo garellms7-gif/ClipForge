@@ -45,6 +45,11 @@ class ProcessRequest(BaseModel):
     min_silence_duration: float = 0.5
 
 
+class RespawnRequest(BaseModel):
+    black_threshold: float = 0.1   # 0.0 (pure black) – 1.0 (white)
+    min_duration: float = 1.5      # seconds of black+silent to qualify
+
+
 # ---------------------------------------------------------------------------
 # ffmpeg availability check (runs once at startup)
 # ---------------------------------------------------------------------------
@@ -59,14 +64,22 @@ def _check_ffmpeg() -> None:
             raise RuntimeError("ffmpeg is not installed on the server. Contact support.")
 
 
+def _check_cv2() -> None:
+    """Raise RuntimeError if opencv-python is not importable."""
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        raise RuntimeError("opencv-python is not installed on the server. Contact support.")
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    try:
-        _check_ffmpeg()
-    except RuntimeError as exc:
-        # Log prominently — the server will still start but processing will fail
-        import sys
-        print(f"\n[ClipForge] WARNING: {exc}\n", file=sys.stderr)
+    import sys
+    for check in (_check_ffmpeg, _check_cv2):
+        try:
+            check()
+        except RuntimeError as exc:
+            print(f"\n[ClipForge] WARNING: {exc}\n", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +138,11 @@ async def upload_video(file: UploadFile = File(...)):
         "output_path": None,
         "error": None,
         "filename": file.filename,
+        # respawn fields (populated by /process/respawn/{job_id})
+        "respawn_status": "idle",
+        "respawn_output_path": None,
+        "respawn_stats": None,
+        "respawn_error": None,
     }
 
     return {"job_id": job_id}
@@ -384,6 +402,210 @@ def concat_video(
         raise RuntimeError(
             f"ffmpeg failed while building the output file. Details: {result.stderr[-1000:]}"
         )
+
+
+@app.post("/process/respawn/{job_id}")
+async def process_respawn(job_id: str, req: RespawnRequest):
+    """
+    Detect and remove respawn-wait segments: frames that are black AND silent
+    for at least req.min_duration seconds.
+    """
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("respawn_status") == "processing":
+        raise HTTPException(status_code=400, detail="Respawn processing is already in progress.")
+
+    try:
+        _check_ffmpeg()
+        _check_cv2()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    job["respawn_status"] = "processing"
+    job["respawn_error"] = None
+
+    input_path = job["input_path"]
+    job_dir = Path(input_path).parent
+    output_path = job_dir / f"{job_id}_respawn_processed.mp4"
+
+    try:
+        # Detect black-frame segments
+        black_segs = detect_black_frames(input_path, req.black_threshold, job_dir)
+
+        # Detect silence with a lenient threshold so short dips register
+        silence_segs = detect_silence(input_path, -35.0, 0.3)
+
+        # Find segments where BOTH conditions overlap >= min_duration
+        respawn_segs = find_respawn_segments(black_segs, silence_segs, req.min_duration)
+
+        if not respawn_segs:
+            job["respawn_status"] = "done"
+            job["respawn_output_path"] = None
+            job["respawn_stats"] = {"segments_removed": 0, "time_saved_seconds": 0.0}
+            return {"status": "done", "segments_removed": 0, "time_saved_seconds": 0.0}
+
+        duration = get_video_duration(input_path)
+        keep_intervals = invert_silence_segments(respawn_segs, duration)
+        concat_video(input_path, keep_intervals, str(output_path))
+
+        time_saved = round(sum(e - s for s, e in respawn_segs), 1)
+        stats = {"segments_removed": len(respawn_segs), "time_saved_seconds": time_saved}
+
+        job["respawn_status"] = "done"
+        job["respawn_output_path"] = str(output_path)
+        job["respawn_stats"] = stats
+
+        return {"status": "done", **stats}
+
+    except HTTPException:
+        raise
+    except Exception:
+        job["respawn_status"] = "error"
+        job["respawn_error"] = "Processing failed. Try adjusting your settings and running again."
+        raise HTTPException(
+            status_code=500,
+            detail="Processing failed. Try adjusting your settings and running again.",
+        )
+
+
+@app.get("/download/respawn/{job_id}")
+async def download_respawn_video(job_id: str):
+    """Stream the respawn-processed file back as an attachment."""
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    respawn_status = job.get("respawn_status", "idle")
+
+    if respawn_status == "processing":
+        raise HTTPException(status_code=400, detail="Respawn processing is still in progress.")
+    if respawn_status == "error":
+        raise HTTPException(status_code=400, detail="Respawn processing encountered an error. Please try again.")
+    if respawn_status != "done":
+        raise HTTPException(status_code=400, detail="Respawn processing has not been run yet.")
+
+    output_path = job.get("respawn_output_path")
+    if not output_path:
+        raise HTTPException(status_code=400, detail="No respawn waits were detected — nothing to download.")
+    if not Path(output_path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Processed file not found on disk. It may have been cleaned up — please process again.",
+        )
+
+    original_name = Path(job.get("filename", "output.mp4")).stem
+    download_name = f"{original_name}_respawn_removed.mp4"
+
+    return FileResponse(
+        path=output_path,
+        media_type="video/mp4",
+        filename=download_name,
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Respawn detection helpers
+# ---------------------------------------------------------------------------
+
+def detect_black_frames(
+    input_path: str,
+    threshold: float,
+    job_dir: Path,
+) -> list[tuple[float, float]]:
+    """
+    Extract 1fps JPEG frames via ffmpeg, measure average greyscale brightness
+    using cv2, and return (start, end) segments in seconds where brightness < threshold.
+    threshold is normalised to [0.0, 1.0].
+    """
+    import cv2
+
+    frames_dir = job_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", "fps=1",
+        str(frames_dir / "frame_%04d.jpg"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to extract frames for black-frame detection. "
+            f"Details: {result.stderr[-500:]}"
+        )
+
+    frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+    black_seconds: list[int] = []
+
+    for i, frame_path in enumerate(frame_files):
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # cv2.mean returns (mean, 0, 0, 0) for single-channel images
+        mean_brightness = float(cv2.mean(gray)[0]) / 255.0
+        if mean_brightness < threshold:
+            black_seconds.append(i)  # frame i covers [i, i+1) seconds
+
+    if not black_seconds:
+        return []
+
+    # Merge consecutive black seconds into (start, end) intervals
+    segments: list[tuple[float, float]] = []
+    seg_start = black_seconds[0]
+    prev = black_seconds[0]
+
+    for sec in black_seconds[1:]:
+        if sec == prev + 1:
+            prev = sec
+        else:
+            segments.append((float(seg_start), float(prev + 1)))
+            seg_start = sec
+            prev = sec
+    segments.append((float(seg_start), float(prev + 1)))
+
+    return segments
+
+
+def find_respawn_segments(
+    black_segs: list[tuple[float, float]],
+    silence_segs: list[tuple[float, float]],
+    min_duration: float,
+) -> list[tuple[float, float]]:
+    """
+    Intersect black-frame and silent segments. Keep only overlaps >= min_duration,
+    then merge any adjacent results.
+    """
+    overlaps: list[tuple[float, float]] = []
+
+    for b_start, b_end in black_segs:
+        for s_start, s_end in silence_segs:
+            start = max(b_start, s_start)
+            end = min(b_end, s_end)
+            if end - start >= min_duration:
+                overlaps.append((start, end))
+
+    if not overlaps:
+        return overlaps
+
+    overlaps.sort()
+    merged: list[tuple[float, float]] = [overlaps[0]]
+    for start, end in overlaps[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    return merged
 
 
 if __name__ == "__main__":
