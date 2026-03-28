@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ClipForge",
-  description: "Remove dead space from your videos automatically",
+  title: "CLIPFORGE",
+  description: "Remove dead space and silence from your videos",
 };
 
 export default function RootLayout({

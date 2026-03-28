@@ -1,15 +1,14 @@
-import os
 import uuid
 import json
 import subprocess
 import tempfile
-import shutil
 from pathlib import Path
 from typing import Dict, Any
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 import uvicorn
 
 app = FastAPI(title="ClipForge API", version="0.1.0")
@@ -22,16 +21,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory job store: job_id -> { status, input_path, output_path, error }
+# In-memory job store: job_id -> { status, input_path, output_path, error, filename }
 jobs: Dict[str, Dict[str, Any]] = {}
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "clipforge"
 TEMP_DIR.mkdir(exist_ok=True)
 
 
+class ProcessRequest(BaseModel):
+    threshold_db: float = -35.0
+    min_silence_duration: float = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
-    """Accept a video file and save it to temp storage, returning a job_id."""
+    """Accept a video file, save to temp storage, return job_id."""
     job_id = str(uuid.uuid4())
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -44,22 +52,18 @@ async def upload_video(file: UploadFile = File(...)):
         f.write(content)
 
     jobs[job_id] = {
-        "status": "uploaded",
+        "status": "pending",
         "input_path": str(input_path),
         "output_path": None,
         "error": None,
         "filename": file.filename or "video.mp4",
     }
 
-    return {"job_id": job_id, "status": "uploaded", "filename": file.filename}
+    return {"job_id": job_id}
 
 
-@app.post("/process")
-async def process_video(
-    job_id: str = Form(...),
-    silence_threshold: float = Form(-30.0),
-    min_silence_duration: float = Form(0.5),
-):
+@app.post("/process/{job_id}")
+async def process_video(job_id: str, req: ProcessRequest):
     """
     Run dead space removal on the uploaded video.
     Uses ffmpeg silencedetect to find silent segments, then trims them out.
@@ -68,33 +72,38 @@ async def process_video(
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
-    if job["status"] not in ("uploaded", "error"):
-        raise HTTPException(status_code=400, detail=f"Job is in state '{job['status']}', cannot process")
+    if job["status"] not in ("pending", "error"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is in state '{job['status']}', cannot process",
+        )
 
     job["status"] = "processing"
     input_path = job["input_path"]
     job_dir = Path(input_path).parent
-    output_path = job_dir / "output.mp4"
+    output_path = job_dir / f"{job_id}_processed.mp4"
 
     try:
         # Step 1: Detect silent segments
         silence_segments = detect_silence(
-            input_path, silence_threshold, min_silence_duration
+            input_path, req.threshold_db, req.min_silence_duration
         )
 
-        # Step 2: Build list of non-silent (kept) intervals
+        # Step 2: Invert to get keep intervals
         duration = get_video_duration(input_path)
         keep_intervals = invert_silence_segments(silence_segments, duration)
 
         if not keep_intervals:
-            raise ValueError("No non-silent segments found. Try lowering the silence threshold.")
+            raise ValueError(
+                "No non-silent segments found. Try lowering the silence threshold."
+            )
 
         # Step 3: Cut and concatenate non-silent segments
         concat_video(input_path, keep_intervals, str(output_path))
 
         job["status"] = "done"
         job["output_path"] = str(output_path)
-        return {"job_id": job_id, "status": "done"}
+        return {"status": "done", "job_id": job_id}
 
     except Exception as e:
         job["status"] = "error"
@@ -104,7 +113,7 @@ async def process_video(
 
 @app.get("/status/{job_id}")
 async def get_status(job_id: str):
-    """Return current status of a job."""
+    """Return current job status: pending | processing | done | error."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
@@ -112,19 +121,20 @@ async def get_status(job_id: str):
         "job_id": job_id,
         "status": job["status"],
         "error": job.get("error"),
-        "filename": job.get("filename"),
     }
 
 
 @app.get("/download/{job_id}")
 async def download_video(job_id: str):
-    """Return the processed video file."""
+    """Stream the processed file back as an attachment."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
     if job["status"] != "done":
-        raise HTTPException(status_code=400, detail=f"Job not ready (status: {job['status']})")
+        raise HTTPException(
+            status_code=400, detail=f"Job not ready (status: {job['status']})"
+        )
 
     output_path = job["output_path"]
     if not output_path or not Path(output_path).exists():
@@ -137,6 +147,7 @@ async def download_video(job_id: str):
         path=output_path,
         media_type="video/mp4",
         filename=download_name,
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
 
@@ -144,20 +155,23 @@ async def download_video(job_id: str):
 # FFmpeg helpers
 # ---------------------------------------------------------------------------
 
-def detect_silence(input_path: str, threshold_db: float, min_duration: float) -> list[tuple[float, float]]:
+def detect_silence(
+    input_path: str, threshold_db: float, min_duration: float
+) -> list[tuple[float, float]]:
     """
-    Run ffmpeg silencedetect and return list of (start, end) tuples for silent segments.
+    Run ffmpeg silencedetect and return list of (start, end) tuples.
+    ffmpeg writes silencedetect output to stderr.
     """
     cmd = [
         "ffmpeg", "-i", input_path,
         "-af", f"silencedetect=noise={threshold_db}dB:d={min_duration}",
-        "-f", "null", "-"
+        "-f", "null", "-",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     stderr = result.stderr
 
-    segments = []
-    current_start = None
+    segments: list[tuple[float, float]] = []
+    current_start: float | None = None
 
     for line in stderr.splitlines():
         if "silence_start" in line:
@@ -177,7 +191,7 @@ def detect_silence(input_path: str, threshold_db: float, min_duration: float) ->
                 except ValueError:
                     pass
 
-    # Handle silence that extends to the end of the video
+    # Silence that extends to the end of the file
     if current_start is not None:
         duration = get_video_duration(input_path)
         segments.append((current_start, duration))
@@ -191,7 +205,7 @@ def get_video_duration(input_path: str) -> float:
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_format",
-        input_path
+        input_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -204,11 +218,10 @@ def invert_silence_segments(
     silence_segments: list[tuple[float, float]], total_duration: float
 ) -> list[tuple[float, float]]:
     """
-    Given silent (start, end) intervals, return the non-silent intervals.
-    Adds a small pad around cuts to avoid audio pops.
+    Convert silent intervals to kept intervals, with a small pad at boundaries.
     """
-    PAD = 0.05  # seconds to keep around silence boundaries
-    keep = []
+    PAD = 0.05  # seconds
+    keep: list[tuple[float, float]] = []
     cursor = 0.0
 
     for s_start, s_end in sorted(silence_segments):
@@ -228,30 +241,25 @@ def concat_video(
     intervals: list[tuple[float, float]],
     output_path: str,
 ) -> None:
-    """
-    Use ffmpeg complex filter to select and concatenate non-silent segments.
-    """
+    """Trim and concatenate non-silent segments using ffmpeg filter_complex."""
     if len(intervals) == 1:
         start, end = intervals[0]
-        duration = end - start
         cmd = [
             "ffmpeg", "-y",
             "-i", input_path,
             "-ss", str(start),
-            "-t", str(duration),
+            "-t", str(end - start),
             "-c:v", "libx264", "-c:a", "aac",
             "-movflags", "+faststart",
             output_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg concat failed: {result.stderr[-2000:]}")
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
         return
 
-    # Build a complex filter for multiple segments
-    filter_parts = []
+    filter_parts: list[str] = []
     for i, (start, end) in enumerate(intervals):
-        duration = end - start
         filter_parts.append(
             f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];"
             f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]"
@@ -263,12 +271,10 @@ def concat_video(
     filter_parts.append(f"{video_inputs}concat=n={n}:v=1:a=0[outv]")
     filter_parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[outa]")
 
-    filter_complex = ";".join(filter_parts)
-
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
-        "-filter_complex", filter_complex,
+        "-filter_complex", ";".join(filter_parts),
         "-map", "[outv]",
         "-map", "[outa]",
         "-c:v", "libx264", "-c:a", "aac",
@@ -277,7 +283,7 @@ def concat_video(
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg concat failed: {result.stderr[-2000:]}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
 if __name__ == "__main__":

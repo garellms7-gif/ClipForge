@@ -7,14 +7,20 @@ import StatusBar from "@/components/StatusBar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-type Stage = "idle" | "uploading" | "processing" | "done" | "error";
+// idle      — nothing selected
+// uploading — file selected, POST /upload in flight
+// ready     — upload done, settings visible, waiting for user to hit Process
+// processing — POST /process sent, polling /status
+// done      — job finished
+// error     — something went wrong
+type Stage = "idle" | "uploading" | "ready" | "processing" | "done" | "error";
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
   const [errorMsg, setErrorMsg] = useState<string>("");
-  const [silenceThreshold, setSilenceThreshold] = useState<number>(-30);
+  const [thresholdDb, setThresholdDb] = useState<number>(-35);
   const [minSilenceDuration, setMinSilenceDuration] = useState<number>(0.5);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -25,54 +31,53 @@ export default function Home() {
     }
   };
 
-  const handleFileSelect = useCallback((f: File) => {
+  // Called by DropZone when a file is selected — immediately upload
+  const handleFileSelect = useCallback(async (f: File) => {
     setFile(f);
     setJobId(null);
-    setStage("idle");
     setErrorMsg("");
+    setStage("uploading");
+
+    try {
+      const formData = new FormData();
+      formData.append("file", f);
+      const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Upload failed" }));
+        throw new Error(err.detail ?? "Upload failed");
+      }
+      const { job_id } = await res.json();
+      setJobId(job_id);
+      setStage("ready");
+    } catch (e: unknown) {
+      setStage("error");
+      setErrorMsg(e instanceof Error ? e.message : "Upload failed");
+    }
   }, []);
 
   const handleProcess = async () => {
-    if (!file) return;
-
-    setStage("uploading");
+    if (!jobId) return;
+    setStage("processing");
     setErrorMsg("");
 
     try {
-      // 1. Upload
-      const formData = new FormData();
-      formData.append("file", file);
-      const uploadRes = await fetch(`${API}/upload`, {
+      const res = await fetch(`${API}/process/${jobId}`, {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          threshold_db: thresholdDb,
+          min_silence_duration: minSilenceDuration,
+        }),
       });
-      if (!uploadRes.ok) {
-        const err = await uploadRes.json().catch(() => ({ detail: "Upload failed" }));
-        throw new Error(err.detail ?? "Upload failed");
-      }
-      const { job_id } = await uploadRes.json();
-      setJobId(job_id);
-
-      // 2. Kick off processing
-      setStage("processing");
-      const processForm = new FormData();
-      processForm.append("job_id", job_id);
-      processForm.append("silence_threshold", String(silenceThreshold));
-      processForm.append("min_silence_duration", String(minSilenceDuration));
-
-      const processRes = await fetch(`${API}/process`, {
-        method: "POST",
-        body: processForm,
-      });
-      if (!processRes.ok) {
-        const err = await processRes.json().catch(() => ({ detail: "Processing failed" }));
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Processing failed" }));
         throw new Error(err.detail ?? "Processing failed");
       }
 
-      // 3. Poll for completion
+      // Poll status every 2 seconds
       pollRef.current = setInterval(async () => {
         try {
-          const statusRes = await fetch(`${API}/status/${job_id}`);
+          const statusRes = await fetch(`${API}/status/${jobId}`);
           if (!statusRes.ok) return;
           const { status, error } = await statusRes.json();
           if (status === "done") {
@@ -81,12 +86,12 @@ export default function Home() {
           } else if (status === "error") {
             stopPolling();
             setStage("error");
-            setErrorMsg(error ?? "Unknown error");
+            setErrorMsg(error ?? "Unknown processing error");
           }
         } catch {
-          // network hiccup — keep polling
+          // transient network error — keep polling
         }
-      }, 1500);
+      }, 2000);
     } catch (e: unknown) {
       stopPolling();
       setStage("error");
@@ -107,102 +112,132 @@ export default function Home() {
     setErrorMsg("");
   };
 
-  const canProcess = file && stage === "idle";
   const isWorking = stage === "uploading" || stage === "processing";
 
   return (
-    <main className="min-h-screen flex flex-col items-center px-4 py-16"
-      style={{ background: "var(--background)" }}>
+    <main
+      className="min-h-screen flex flex-col items-center px-4 py-16"
+      style={{ background: "var(--bg)" }}
+    >
       {/* Header */}
       <header className="mb-12 text-center">
         <div className="flex items-center justify-center gap-3 mb-3">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-            <rect width="32" height="32" rx="8" fill="#7c3aed" />
-            <path d="M10 22V10l14 6-14 6z" fill="white" />
-            <rect x="22" y="10" width="2.5" height="12" rx="1" fill="white" />
+          {/* Scissors icon */}
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <circle cx="6" cy="6" r="3" stroke="var(--green)" strokeWidth="1.8" />
+            <circle cx="6" cy="18" r="3" stroke="var(--green)" strokeWidth="1.8" />
+            <path
+              d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12"
+              stroke="var(--green)"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+            />
           </svg>
-          <h1 className="text-3xl font-bold tracking-tight text-white">
-            ClipForge
+          <h1
+            className="text-2xl font-bold tracking-[0.2em]"
+            style={{ fontFamily: "'Space Mono', monospace", color: "var(--text)" }}
+          >
+            CLIPFORGE
           </h1>
         </div>
-        <p className="text-sm text-gray-400">
-          Automatically remove dead space &amp; silence from your videos
+        <p className="text-sm" style={{ color: "var(--text-muted)", fontFamily: "'DM Sans', sans-serif" }}>
+          Remove dead space &amp; silence from your videos automatically
         </p>
       </header>
 
-      {/* Card */}
+      {/* Main card */}
       <div
-        className="w-full max-w-2xl rounded-2xl p-8 flex flex-col gap-8"
-        style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
+        className="w-full flex flex-col gap-6"
+        style={{ maxWidth: 680 }}
       >
-        {/* Drop zone */}
-        <DropZone file={file} onFileSelect={handleFileSelect} disabled={isWorking} />
-
-        {/* Settings */}
-        <SettingsPanel
-          silenceThreshold={silenceThreshold}
-          onSilenceThresholdChange={setSilenceThreshold}
-          minSilenceDuration={minSilenceDuration}
-          onMinSilenceDurationChange={setMinSilenceDuration}
+        {/* Drop zone — always visible */}
+        <DropZone
+          file={file}
+          stage={stage}
+          onFileSelect={handleFileSelect}
           disabled={isWorking}
         />
 
-        {/* Status bar */}
+        {/* Settings — only after a file is uploaded */}
+        {(stage === "ready" || stage === "processing" || stage === "done" || stage === "error") && (
+          <SettingsPanel
+            thresholdDb={thresholdDb}
+            onThresholdDbChange={setThresholdDb}
+            minSilenceDuration={minSilenceDuration}
+            onMinSilenceDurationChange={setMinSilenceDuration}
+            disabled={isWorking || stage === "done"}
+          />
+        )}
+
+        {/* Status feedback */}
         <StatusBar stage={stage} errorMsg={errorMsg} />
 
-        {/* Actions */}
-        <div className="flex gap-3">
-          {stage === "done" ? (
-            <>
-              <button
-                onClick={handleDownload}
-                className="flex-1 py-3 px-6 rounded-xl font-semibold text-white transition-colors"
-                style={{ background: "#7c3aed" }}
-                onMouseEnter={e => (e.currentTarget.style.background = "#6d28d9")}
-                onMouseLeave={e => (e.currentTarget.style.background = "#7c3aed")}
-              >
-                Download Processed Video
-              </button>
-              <button
-                onClick={handleReset}
-                className="py-3 px-5 rounded-xl font-medium transition-colors"
-                style={{
-                  background: "var(--surface-2)",
-                  border: "1px solid var(--border)",
-                  color: "#a0a0b8",
-                }}
-                onMouseEnter={e => (e.currentTarget.style.color = "#e2e2f0")}
-                onMouseLeave={e => (e.currentTarget.style.color = "#a0a0b8")}
-              >
-                Start Over
-              </button>
-            </>
-          ) : (
+        {/* Action buttons */}
+        {stage === "done" ? (
+          <div className="flex gap-3">
             <button
-              onClick={canProcess ? handleProcess : undefined}
-              disabled={!canProcess || isWorking}
-              className="flex-1 py-3 px-6 rounded-xl font-semibold text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              onClick={handleDownload}
+              className="flex-1 py-3 px-6 font-semibold text-sm transition-all"
               style={{
-                background: canProcess && !isWorking ? "#7c3aed" : "#4b4b6b",
-                cursor: canProcess && !isWorking ? "pointer" : "not-allowed",
+                fontFamily: "'Space Mono', monospace",
+                background: "var(--green)",
+                color: "#000",
+                border: "none",
+                cursor: "pointer",
+                letterSpacing: "0.05em",
               }}
-              onMouseEnter={e => {
-                if (canProcess && !isWorking)
-                  e.currentTarget.style.background = "#6d28d9";
-              }}
-              onMouseLeave={e => {
-                if (canProcess && !isWorking)
-                  e.currentTarget.style.background = "#7c3aed";
-              }}
+              onMouseEnter={e => (e.currentTarget.style.opacity = "0.85")}
+              onMouseLeave={e => (e.currentTarget.style.opacity = "1")}
             >
-              {isWorking ? "Processing…" : "Process Video"}
+              DOWNLOAD PROCESSED VIDEO
             </button>
-          )}
-        </div>
+            <button
+              onClick={handleReset}
+              className="py-3 px-5 text-sm font-medium transition-all"
+              style={{
+                background: "transparent",
+                border: "1px solid var(--border)",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+              }}
+              onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--border-active)")}
+              onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border)")}
+            >
+              Start over
+            </button>
+          </div>
+        ) : stage === "ready" || (stage === "error" && jobId) ? (
+          <button
+            onClick={handleProcess}
+            disabled={isWorking}
+            className="w-full py-3 px-6 font-bold text-sm tracking-widest transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              fontFamily: "'Space Mono', monospace",
+              background: "transparent",
+              border: "1px solid var(--green)",
+              color: "var(--green)",
+              cursor: "pointer",
+              letterSpacing: "0.1em",
+            }}
+            onMouseEnter={e => {
+              if (!isWorking) {
+                e.currentTarget.style.background = "var(--green-dim)";
+              }
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.background = "transparent";
+            }}
+          >
+            REMOVE DEAD SPACE
+          </button>
+        ) : null}
       </div>
 
-      <footer className="mt-10 text-xs text-gray-600">
-        ClipForge &mdash; Phase 0
+      <footer
+        className="mt-16 text-xs"
+        style={{ color: "var(--text-dim)", fontFamily: "'Space Mono', monospace" }}
+      >
+        CLIPFORGE / PHASE 0
       </footer>
     </main>
   );
