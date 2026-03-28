@@ -9,7 +9,7 @@ from typing import Dict, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 import uvicorn
 
@@ -50,6 +50,12 @@ class RespawnRequest(BaseModel):
     min_duration: float = 1.5      # seconds of black+silent to qualify
 
 
+class HypeRequest(BaseModel):
+    audio_sensitivity: float = 0.7   # 0.1–1.0 RMS energy threshold (normalised)
+    motion_sensitivity: float = 0.6  # 0.1–1.0 frame-diff threshold (normalised)
+    min_gap_seconds: float = 3.0     # merge events closer than this
+
+
 # ---------------------------------------------------------------------------
 # ffmpeg availability check (runs once at startup)
 # ---------------------------------------------------------------------------
@@ -72,10 +78,18 @@ def _check_cv2() -> None:
         raise RuntimeError("opencv-python is not installed on the server. Contact support.")
 
 
+def _check_librosa() -> None:
+    """Raise RuntimeError if librosa is not importable."""
+    try:
+        import librosa  # noqa: F401
+    except ImportError:
+        raise RuntimeError("librosa is not installed on the server. Contact support.")
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     import sys
-    for check in (_check_ffmpeg, _check_cv2):
+    for check in (_check_ffmpeg, _check_cv2, _check_librosa):
         try:
             check()
         except RuntimeError as exc:
@@ -143,6 +157,10 @@ async def upload_video(file: UploadFile = File(...)):
         "respawn_output_path": None,
         "respawn_stats": None,
         "respawn_error": None,
+        # hype fields (populated by /analyze/hype/{job_id})
+        "hype_status": "idle",
+        "hype_moments": None,
+        "hype_error": None,
     }
 
     return {"job_id": job_id}
@@ -606,6 +624,263 @@ def find_respawn_segments(
             merged.append((start, end))
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Hype Moment Detection endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/analyze/hype/{job_id}")
+async def analyze_hype(job_id: str, req: HypeRequest):
+    """
+    Detect hype moments: timestamps where audio energy AND motion both spike
+    simultaneously. Returns a ranked list of { timestamp, score, label }.
+    Does NOT modify the video.
+    """
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("hype_status") == "analyzing":
+        raise HTTPException(status_code=400, detail="Hype analysis is already in progress.")
+
+    try:
+        _check_ffmpeg()
+        _check_cv2()
+        _check_librosa()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    job["hype_status"] = "analyzing"
+    job["hype_error"] = None
+
+    input_path = job["input_path"]
+    job_dir = Path(input_path).parent
+
+    try:
+        # Extract a mono 22050 Hz WAV for librosa
+        audio_path = job_dir / "audio.wav"
+        _extract_audio_wav(input_path, str(audio_path))
+
+        audio_peaks = _audio_rms_peaks(str(audio_path), req.audio_sensitivity)
+        motion_peaks = _motion_diff_peaks(input_path, req.motion_sensitivity, job_dir)
+
+        moments = _merge_hype_moments(audio_peaks, motion_peaks, req.min_gap_seconds)
+
+        job["hype_status"] = "done"
+        job["hype_moments"] = moments
+
+        return {"status": "done", "moments": moments}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        job["hype_status"] = "error"
+        job["hype_error"] = "Analysis failed. Try adjusting your settings and running again."
+        raise HTTPException(
+            status_code=500,
+            detail="Analysis failed. Try adjusting your settings and running again.",
+        )
+
+
+@app.get("/analyze/hype/{job_id}/export")
+async def export_hype_markers(job_id: str):
+    """Return a CapCut-compatible XML file with hype moment markers."""
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("hype_status") != "done":
+        raise HTTPException(
+            status_code=400,
+            detail="Hype analysis has not been completed yet.",
+        )
+
+    moments = job.get("hype_moments") or []
+    if not moments:
+        raise HTTPException(
+            status_code=400,
+            detail="No hype moments were detected — nothing to export.",
+        )
+
+    xml_content = _build_capcut_xml(moments)
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={"Content-Disposition": 'attachment; filename="hype_markers.xml"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hype detection helpers
+# ---------------------------------------------------------------------------
+
+def _extract_audio_wav(input_path: str, output_path: str) -> None:
+    """Extract a mono 22050 Hz WAV track from a video using ffmpeg."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-ac", "1", "-ar", "22050",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to extract audio from the video. "
+            f"Details: {result.stderr[-500:]}"
+        )
+
+
+def _audio_rms_peaks(
+    audio_path: str, sensitivity: float
+) -> list[tuple[float, float]]:
+    """
+    Load WAV with librosa, compute RMS energy in 0.1 s windows,
+    normalise, and return (timestamp_seconds, normalised_rms) for every
+    frame >= sensitivity.
+    """
+    import librosa
+
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+
+    hop = int(sr * 0.1)          # 0.1 s per frame
+    frame_len = hop * 2          # 0.2 s analysis window
+
+    rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
+    peak_val = float(rms.max())
+    if peak_val == 0:
+        return []
+
+    rms_norm = rms / peak_val
+    return [
+        (float(i * 0.1), float(rms_norm[i]))
+        for i in range(len(rms_norm))
+        if rms_norm[i] >= sensitivity
+    ]
+
+
+def _motion_diff_peaks(
+    input_path: str, sensitivity: float, job_dir: Path
+) -> list[tuple[float, float]]:
+    """
+    Extract 5fps frames via ffmpeg, compute absolute greyscale diff between
+    consecutive frames, normalise, and return (timestamp_seconds, normalised_diff)
+    for every frame >= sensitivity.
+    """
+    import cv2
+
+    frames_dir = job_dir / "hype_frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", "fps=5",
+        str(frames_dir / "frame_%05d.jpg"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to extract frames for motion analysis. "
+            f"Details: {result.stderr[-500:]}"
+        )
+
+    frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+    if len(frame_files) < 2:
+        return []
+
+    diffs: list[float] = []
+    prev_gray = None
+
+    for frame_path in frame_files:
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            diffs.append(0.0)
+            prev_gray = None
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff_img = cv2.absdiff(gray, prev_gray)
+            diffs.append(float(cv2.mean(diff_img)[0]))
+        else:
+            diffs.append(0.0)
+        prev_gray = gray
+
+    max_diff = max(diffs) if diffs else 0.0
+    if max_diff == 0:
+        return []
+
+    return [
+        (float(i / 5.0), float(diffs[i] / max_diff))
+        for i in range(len(diffs))
+        if diffs[i] / max_diff >= sensitivity
+    ]
+
+
+def _merge_hype_moments(
+    audio_peaks: list[tuple[float, float]],
+    motion_peaks: list[tuple[float, float]],
+    min_gap: float,
+    overlap_window: float = 0.5,
+) -> list[dict]:
+    """
+    Intersect audio and motion peak lists: keep only timestamps where both
+    signals are active within overlap_window seconds of each other.
+    Score = average of the two normalised values.
+    Then merge events closer than min_gap seconds, keeping the highest score.
+    """
+    raw: list[tuple[float, float]] = []
+
+    for a_t, a_s in audio_peaks:
+        for m_t, m_s in motion_peaks:
+            if abs(a_t - m_t) <= overlap_window:
+                t = (a_t + m_t) / 2.0
+                score = min(1.0, (a_s + m_s) / 2.0)
+                raw.append((t, score))
+
+    if not raw:
+        return []
+
+    raw.sort(key=lambda x: x[0])
+
+    # Deduplicate within overlap_window first
+    deduped: list[tuple[float, float]] = [raw[0]]
+    for t, score in raw[1:]:
+        if t - deduped[-1][0] <= overlap_window:
+            if score > deduped[-1][1]:
+                deduped[-1] = (t, score)
+        else:
+            deduped.append((t, score))
+
+    # Then merge events closer than min_gap
+    merged: list[tuple[float, float]] = [deduped[0]]
+    for t, score in deduped[1:]:
+        if t - merged[-1][0] < min_gap:
+            if score > merged[-1][1]:
+                merged[-1] = (t, score)
+        else:
+            merged.append((t, score))
+
+    return [
+        {"timestamp": round(t, 2), "score": round(s, 3), "label": "Hype Moment"}
+        for t, s in merged
+    ]
+
+
+def _build_capcut_xml(moments: list[dict]) -> str:
+    """Generate a CapCut-compatible XML marker file (30 fps frame numbers)."""
+    lines = ["<sequence>", "  <markers>"]
+    for m in moments:
+        frame = round(m["timestamp"] * 30)
+        lines.append(
+            f'    <marker time="{frame}" name="Hype Moment" color="red"/>'
+        )
+    lines += ["  </markers>", "</sequence>"]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

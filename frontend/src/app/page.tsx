@@ -5,6 +5,7 @@ import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
 import RespawnPanel, { type RespawnStage, type RespawnStats } from "@/components/RespawnPanel";
+import HypePanel, { type HypeStage, type HypeMoment } from "@/components/HypePanel";
 import { parseApiError } from "@/lib/api";
 
 const BASE =
@@ -22,6 +23,9 @@ const DEFAULT_THRESHOLD = -35;
 const DEFAULT_DURATION = 0.5;
 const DEFAULT_BLACK_THRESHOLD = 0.1;
 const DEFAULT_RESPAWN_MIN_DURATION = 1.5;
+const DEFAULT_AUDIO_SENSITIVITY = 0.7;
+const DEFAULT_MOTION_SENSITIVITY = 0.6;
+const DEFAULT_MIN_GAP = 3.0;
 
 export default function Home() {
   // ── Upload / dead space state ──
@@ -41,6 +45,15 @@ export default function Home() {
   const [respawnStage, setRespawnStage] = useState<RespawnStage>("idle");
   const [respawnStats, setRespawnStats] = useState<RespawnStats | null>(null);
   const [respawnErrorMsg, setRespawnErrorMsg] = useState<string>("");
+
+  // ── Hype state ──
+  const [hypeEnabled, setHypeEnabled] = useState(false);
+  const [audioSensitivity, setAudioSensitivity] = useState<number>(DEFAULT_AUDIO_SENSITIVITY);
+  const [motionSensitivity, setMotionSensitivity] = useState<number>(DEFAULT_MOTION_SENSITIVITY);
+  const [minGapSeconds, setMinGapSeconds] = useState<number>(DEFAULT_MIN_GAP);
+  const [hypeStage, setHypeStage] = useState<HypeStage>("idle");
+  const [hypeMoments, setHypeMoments] = useState<HypeMoment[]>([]);
+  const [hypeErrorMsg, setHypeErrorMsg] = useState<string>("");
 
   // ─────────────────────────────────────────────────────────
   // Helpers
@@ -69,6 +82,10 @@ export default function Home() {
     setRespawnStage("idle");
     setRespawnStats(null);
     setRespawnErrorMsg("");
+    // reset hype state for the new file
+    setHypeStage("idle");
+    setHypeMoments([]);
+    setHypeErrorMsg("");
 
     try {
       const formData = new FormData();
@@ -168,6 +185,14 @@ export default function Home() {
     setRespawnErrorMsg("");
     setBlackThreshold(DEFAULT_BLACK_THRESHOLD);
     setRespawnMinDuration(DEFAULT_RESPAWN_MIN_DURATION);
+    // reset hype too
+    setHypeEnabled(false);
+    setHypeStage("idle");
+    setHypeMoments([]);
+    setHypeErrorMsg("");
+    setAudioSensitivity(DEFAULT_AUDIO_SENSITIVITY);
+    setMotionSensitivity(DEFAULT_MOTION_SENSITIVITY);
+    setMinGapSeconds(DEFAULT_MIN_GAP);
   };
 
   // ─────────────────────────────────────────────────────────
@@ -215,6 +240,65 @@ export default function Home() {
     setRespawnStage("idle");
     setRespawnErrorMsg("");
     setRespawnStats(null);
+  };
+
+  // ─────────────────────────────────────────────────────────
+  // Hype handlers
+  // ─────────────────────────────────────────────────────────
+
+  const handleHypeAnalyze = async () => {
+    if (!jobId) return;
+    setHypeStage("analyzing");
+    setHypeErrorMsg("");
+    setHypeMoments([]);
+
+    try {
+      const res = await fetch(`${BASE}/analyze/hype/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio_sensitivity: audioSensitivity,
+          motion_sensitivity: motionSensitivity,
+          min_gap_seconds: minGapSeconds,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(await parseApiError(res));
+      }
+      const data = await res.json();
+      setHypeMoments(data.moments ?? []);
+      setHypeStage("done");
+    } catch (e: unknown) {
+      setHypeStage("error");
+      setHypeErrorMsg(
+        e instanceof Error ? e.message : "Something went wrong. Please try again."
+      );
+    }
+  };
+
+  const handleHypeExport = async () => {
+    if (!jobId) return;
+    try {
+      const res = await fetch(`${BASE}/analyze/hype/${jobId}/export`);
+      if (!res.ok) {
+        throw new Error(await parseApiError(res));
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "hype_markers.xml";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // silent — export failure doesn't change stage
+    }
+  };
+
+  const handleHypeRetry = () => {
+    setHypeStage("idle");
+    setHypeErrorMsg("");
+    setHypeMoments([]);
   };
 
   // ─────────────────────────────────────────────────────────
@@ -388,6 +472,26 @@ export default function Home() {
               onRetry={handleRespawnRetry}
               hasJob={jobId !== null}
               disabled={isWorking || respawnStage === "processing"}
+            />
+
+            {/* ── Hype Moment Detector card ── */}
+            <HypePanel
+              enabled={hypeEnabled}
+              onEnabledChange={setHypeEnabled}
+              audioSensitivity={audioSensitivity}
+              onAudioSensitivityChange={setAudioSensitivity}
+              motionSensitivity={motionSensitivity}
+              onMotionSensitivityChange={setMotionSensitivity}
+              minGapSeconds={minGapSeconds}
+              onMinGapSecondsChange={setMinGapSeconds}
+              stage={hypeStage}
+              moments={hypeMoments}
+              errorMsg={hypeErrorMsg}
+              onAnalyze={handleHypeAnalyze}
+              onExport={handleHypeExport}
+              onRetry={handleHypeRetry}
+              hasJob={jobId !== null}
+              disabled={isWorking || hypeStage === "analyzing"}
             />
           </>
         )}
