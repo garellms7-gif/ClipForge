@@ -14,7 +14,7 @@ clipforge/
 ## Prerequisites
 
 - **Node.js** 18+
-- **Python** 3.10+
+- **Python** 3.11+
 - **ffmpeg** (must be available on your PATH)
 
 Install ffmpeg:
@@ -42,6 +42,12 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Copy and edit the env file
+cp .env.example .env
+# ALLOWED_ORIGINS defaults to http://localhost:3000
+# Add your Vercel URL when deploying, e.g.:
+# ALLOWED_ORIGINS=http://localhost:3000,https://my-app.vercel.app
+
 # Start the dev server
 uvicorn main:app --reload --port 8000
 ```
@@ -49,14 +55,28 @@ uvicorn main:app --reload --port 8000
 The API will be available at `http://localhost:8000`.
 Interactive docs: `http://localhost:8000/docs`
 
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins |
+| `PORT` | `8000` | Port to bind (set automatically by Railway) |
+
 ### API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/upload` | Upload a video file; returns `job_id` |
-| `POST` | `/process` | Start silence removal; params: `job_id`, `silence_threshold` (dB), `min_silence_duration` (s) |
-| `GET` | `/status/{job_id}` | Poll job status: `uploaded` → `processing` → `done` / `error` |
-| `GET` | `/download/{job_id}` | Download the processed video |
+| `POST` | `/upload` | Upload a video file; returns `{ job_id }` |
+| `POST` | `/process/{job_id}` | Start silence removal; JSON body: `{ threshold_db, min_silence_duration }` |
+| `GET` | `/status/{job_id}` | Poll job status: `pending` → `processing` → `done` / `error` |
+| `GET` | `/download/{job_id}` | Download the processed video as an attachment |
+
+### Deploy to Railway
+
+1. Push the repo to GitHub.
+2. Create a new Railway project → **Deploy from GitHub repo** → select the `backend/` root.
+3. Railway will detect the `Procfile` and `runtime.txt` automatically.
+4. Add the `ALLOWED_ORIGINS` environment variable with your Vercel frontend URL.
 
 ---
 
@@ -68,9 +88,9 @@ cd frontend
 # Install dependencies
 npm install
 
-# Copy the example env file
+# Copy and edit the env file
 cp .env.local.example .env.local
-# Edit .env.local if your backend runs on a different port/host
+# Set NEXT_PUBLIC_BACKEND_URL to your backend URL
 
 # Start the dev server
 npm run dev
@@ -78,22 +98,36 @@ npm run dev
 
 Open `http://localhost:3000` in your browser.
 
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEXT_PUBLIC_BACKEND_URL` | `http://localhost:8000` | Base URL of the FastAPI backend |
+
+### Deploy to Vercel
+
+1. Import the repo in Vercel → set **Root Directory** to `frontend/`.
+2. Add `NEXT_PUBLIC_BACKEND_URL` pointing at your Railway backend URL.
+3. Vercel will use `vercel.json` for build settings automatically.
+
 ---
 
 ## Usage
 
-1. Drag and drop (or click to browse) a video file onto the upload zone.
+1. Drag and drop (or click to browse) a video file — it uploads immediately.
 2. Adjust **Silence Threshold** (dB) — audio below this level is treated as silence.
 3. Adjust **Minimum Silence Duration** (s) — only silences longer than this get removed.
-4. Click **Process Video**.
+4. Click **Remove Dead Space**.
 5. Wait for processing to complete, then click **Download Processed Video**.
+6. If processing fails, click **Try Again** to adjust settings and retry without re-uploading.
 
 ---
 
 ## How it works
 
-1. The frontend uploads the video to `POST /upload`.
-2. `POST /process` runs `ffmpeg -af silencedetect` to find silent segments, then uses `ffmpeg` trim/concat filters to cut them out and stitch the remaining audio+video together.
-3. The result is streamed back via `GET /download/{job_id}`.
+1. The frontend uploads the video to `POST /upload` on file select.
+2. `POST /process/{job_id}` runs `ffmpeg -af silencedetect` to find silent segments, then uses `ffmpeg` trim/concat filters to cut them out and stitch the remaining audio+video together.
+3. The frontend polls `GET /status/{job_id}` every 2 s until `done` or `error`.
+4. `GET /download/{job_id}` streams the finished MP4 as an attachment.
 
 Jobs are stored in memory — restarting the backend clears all jobs and temp files.

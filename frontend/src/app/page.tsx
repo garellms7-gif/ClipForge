@@ -5,15 +5,26 @@ import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API =
+  process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
-// idle      — nothing selected
-// uploading — file selected, POST /upload in flight
-// ready     — upload done, settings visible, waiting for user to hit Process
+// idle       — nothing selected
+// uploading  — file dropped, POST /upload in flight
+// ready      — upload done, settings visible
 // processing — POST /process sent, polling /status
-// done      — job finished
-// error     — something went wrong
+// done       — job finished
+// error      — something went wrong
 type Stage = "idle" | "uploading" | "ready" | "processing" | "done" | "error";
+
+/** Extract a human-readable message from a fetch Response error body. */
+async function parseApiError(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = await res.json();
+    return body?.detail ?? body?.message ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -31,8 +42,9 @@ export default function Home() {
     }
   };
 
-  // Called by DropZone when a file is selected — immediately upload
+  // Upload fires immediately on file drop/select
   const handleFileSelect = useCallback(async (f: File) => {
+    stopPolling();
     setFile(f);
     setJobId(null);
     setErrorMsg("");
@@ -43,15 +55,18 @@ export default function Home() {
       formData.append("file", f);
       const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Upload failed" }));
-        throw new Error(err.detail ?? "Upload failed");
+        throw new Error(await parseApiError(res, "Upload failed. Please try again."));
       }
       const { job_id } = await res.json();
       setJobId(job_id);
       setStage("ready");
     } catch (e: unknown) {
       setStage("error");
-      setErrorMsg(e instanceof Error ? e.message : "Upload failed");
+      setErrorMsg(
+        e instanceof Error
+          ? e.message
+          : "Upload failed. Check your connection and try again."
+      );
     }
   }, []);
 
@@ -70,15 +85,16 @@ export default function Home() {
         }),
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Processing failed" }));
-        throw new Error(err.detail ?? "Processing failed");
+        throw new Error(
+          await parseApiError(res, "Processing failed. Adjust the settings and try again.")
+        );
       }
 
-      // Poll status every 2 seconds
+      // Poll every 2 s
       pollRef.current = setInterval(async () => {
         try {
           const statusRes = await fetch(`${API}/status/${jobId}`);
-          if (!statusRes.ok) return;
+          if (!statusRes.ok) return; // transient — keep polling
           const { status, error } = await statusRes.json();
           if (status === "done") {
             stopPolling();
@@ -86,16 +102,22 @@ export default function Home() {
           } else if (status === "error") {
             stopPolling();
             setStage("error");
-            setErrorMsg(error ?? "Unknown processing error");
+            setErrorMsg(
+              error ?? "Processing failed. Adjust the settings and try again."
+            );
           }
         } catch {
-          // transient network error — keep polling
+          // network hiccup — keep polling
         }
       }, 2000);
     } catch (e: unknown) {
       stopPolling();
       setStage("error");
-      setErrorMsg(e instanceof Error ? e.message : "Unexpected error");
+      setErrorMsg(
+        e instanceof Error
+          ? e.message
+          : "An unexpected error occurred. Please try again."
+      );
     }
   };
 
@@ -104,6 +126,21 @@ export default function Home() {
     window.open(`${API}/download/${jobId}`, "_blank");
   };
 
+  // "Try Again" — keep the file & jobId, go back to ready so user can tweak settings
+  const handleTryAgain = () => {
+    stopPolling();
+    setErrorMsg("");
+    // If we have a jobId the file is still on the server; go back to ready.
+    // If the error was during upload (no jobId), go back to idle.
+    if (jobId) {
+      setStage("ready");
+    } else {
+      setFile(null);
+      setStage("idle");
+    }
+  };
+
+  // "Process another video" — full reset
   const handleReset = () => {
     stopPolling();
     setFile(null);
@@ -113,6 +150,11 @@ export default function Home() {
   };
 
   const isWorking = stage === "uploading" || stage === "processing";
+  const showSettings =
+    stage === "ready" ||
+    stage === "processing" ||
+    stage === "done" ||
+    stage === "error";
 
   return (
     <main
@@ -122,7 +164,6 @@ export default function Home() {
       {/* Header */}
       <header className="mb-12 text-center">
         <div className="flex items-center justify-center gap-3 mb-3">
-          {/* Scissors icon */}
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
             <circle cx="6" cy="6" r="3" stroke="var(--green)" strokeWidth="1.8" />
             <circle cx="6" cy="18" r="3" stroke="var(--green)" strokeWidth="1.8" />
@@ -140,17 +181,17 @@ export default function Home() {
             CLIPFORGE
           </h1>
         </div>
-        <p className="text-sm" style={{ color: "var(--text-muted)", fontFamily: "'DM Sans', sans-serif" }}>
+        <p
+          className="text-sm"
+          style={{ color: "var(--text-muted)", fontFamily: "'DM Sans', sans-serif" }}
+        >
           Remove dead space &amp; silence from your videos automatically
         </p>
       </header>
 
-      {/* Main card */}
-      <div
-        className="w-full flex flex-col gap-6"
-        style={{ maxWidth: 680 }}
-      >
-        {/* Drop zone — always visible */}
+      {/* Main column */}
+      <div className="w-full flex flex-col gap-6" style={{ maxWidth: 680 }}>
+        {/* Drop zone */}
         <DropZone
           file={file}
           stage={stage}
@@ -158,8 +199,8 @@ export default function Home() {
           disabled={isWorking}
         />
 
-        {/* Settings — only after a file is uploaded */}
-        {(stage === "ready" || stage === "processing" || stage === "done" || stage === "error") && (
+        {/* Settings — shown once a file is uploaded */}
+        {showSettings && (
           <SettingsPanel
             thresholdDb={thresholdDb}
             onThresholdDbChange={setThresholdDb}
@@ -172,12 +213,13 @@ export default function Home() {
         {/* Status feedback */}
         <StatusBar stage={stage} errorMsg={errorMsg} />
 
-        {/* Action buttons */}
-        {stage === "done" ? (
-          <div className="flex gap-3">
+        {/* ── Actions ── */}
+
+        {stage === "done" && (
+          <div className="flex flex-col gap-3">
             <button
               onClick={handleDownload}
-              className="flex-1 py-3 px-6 font-semibold text-sm transition-all"
+              className="w-full py-3 px-6 font-bold text-sm transition-all"
               style={{
                 fontFamily: "'Space Mono', monospace",
                 background: "var(--green)",
@@ -193,8 +235,9 @@ export default function Home() {
             </button>
             <button
               onClick={handleReset}
-              className="py-3 px-5 text-sm font-medium transition-all"
+              className="w-full py-3 px-6 text-sm font-medium transition-all"
               style={{
+                fontFamily: "'DM Sans', sans-serif",
                 background: "transparent",
                 border: "1px solid var(--border)",
                 color: "var(--text-muted)",
@@ -203,14 +246,34 @@ export default function Home() {
               onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--border-active)")}
               onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border)")}
             >
-              Start over
+              Process another video
             </button>
           </div>
-        ) : stage === "ready" || (stage === "error" && jobId) ? (
+        )}
+
+        {stage === "error" && (
+          <button
+            onClick={handleTryAgain}
+            className="w-full py-3 px-6 font-bold text-sm transition-all"
+            style={{
+              fontFamily: "'Space Mono', monospace",
+              background: "transparent",
+              border: "1px solid var(--red)",
+              color: "var(--red)",
+              cursor: "pointer",
+              letterSpacing: "0.1em",
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = "var(--red-dim)")}
+            onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+          >
+            TRY AGAIN
+          </button>
+        )}
+
+        {stage === "ready" && (
           <button
             onClick={handleProcess}
-            disabled={isWorking}
-            className="w-full py-3 px-6 font-bold text-sm tracking-widest transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            className="w-full py-3 px-6 font-bold text-sm transition-all"
             style={{
               fontFamily: "'Space Mono', monospace",
               background: "transparent",
@@ -219,25 +282,19 @@ export default function Home() {
               cursor: "pointer",
               letterSpacing: "0.1em",
             }}
-            onMouseEnter={e => {
-              if (!isWorking) {
-                e.currentTarget.style.background = "var(--green-dim)";
-              }
-            }}
-            onMouseLeave={e => {
-              e.currentTarget.style.background = "transparent";
-            }}
+            onMouseEnter={e => (e.currentTarget.style.background = "var(--green-dim)")}
+            onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
           >
             REMOVE DEAD SPACE
           </button>
-        ) : null}
+        )}
       </div>
 
       <footer
         className="mt-16 text-xs"
-        style={{ color: "var(--text-dim)", fontFamily: "'Space Mono', monospace" }}
+        style={{ color: "var(--text-dim)", fontFamily: "'DM Sans', sans-serif" }}
       >
-        CLIPFORGE / PHASE 0
+        ClipForge &mdash; built for creators
       </footer>
     </main>
   );
