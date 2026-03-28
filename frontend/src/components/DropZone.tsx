@@ -2,11 +2,9 @@
 
 import { useCallback, useRef, useState } from "react";
 
-type Stage = "idle" | "uploading" | "ready" | "processing" | "done" | "error";
-
 interface DropZoneProps {
   file: File | null;
-  stage: Stage;
+  isUploading: boolean;
   onFileSelect: (file: File) => void;
   disabled?: boolean;
 }
@@ -14,7 +12,7 @@ interface DropZoneProps {
 const ACCEPTED_EXT = /\.(mp4|mov|mkv|webm|avi)$/i;
 const ACCEPTED_MIME = ["video/mp4", "video/quicktime", "video/x-matroska", "video/webm", "video/avi"];
 
-export default function DropZone({ file, stage, onFileSelect, disabled }: DropZoneProps) {
+export default function DropZone({ file, isUploading, onFileSelect, disabled }: DropZoneProps) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -42,7 +40,6 @@ export default function DropZone({ file, stage, onFileSelect, disabled }: DropZo
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (f) tryAccept(f);
-    // reset so the same file can be re-selected
     e.target.value = "";
   };
 
@@ -50,8 +47,6 @@ export default function DropZone({ file, stage, onFileSelect, disabled }: DropZo
     bytes < 1024 * 1024
       ? `${(bytes / 1024).toFixed(1)} KB`
       : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-
-  const isUploading = stage === "uploading";
 
   const borderColor = dragging
     ? "var(--green)"
@@ -110,10 +105,7 @@ export default function DropZone({ file, stage, onFileSelect, disabled }: DropZo
           <>
             <VideoIcon active />
             <div className="text-center">
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--text)" }}
-              >
+              <p className="text-sm font-medium" style={{ color: "var(--text)" }}>
                 {file.name}
               </p>
               <p className="text-xs mt-0.5" style={{ color: "var(--text-muted)" }}>
@@ -171,13 +163,7 @@ function UploadingSpinner() {
       style={{ animation: "spin 1s linear infinite" }}
     >
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-      <circle
-        cx="12"
-        cy="12"
-        r="9"
-        stroke="var(--border)"
-        strokeWidth="2"
-      />
+      <circle cx="12" cy="12" r="9" stroke="var(--border)" strokeWidth="2" />
       <path
         d="M12 3a9 9 0 019 9"
         stroke="var(--green)"

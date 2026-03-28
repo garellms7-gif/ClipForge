@@ -1,6 +1,6 @@
 "use client";
 
-type Stage = "idle" | "uploading" | "ready" | "processing" | "done" | "error";
+type Stage = "idle" | "ready" | "processing" | "done" | "error";
 
 interface StatusBarProps {
   stage: Stage;

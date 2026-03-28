@@ -49,14 +49,14 @@ class ProcessRequest(BaseModel):
 # ffmpeg availability check (runs once at startup)
 # ---------------------------------------------------------------------------
 
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
 def _check_ffmpeg() -> None:
     """Raise RuntimeError if ffmpeg or ffprobe are not on PATH."""
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
-            raise RuntimeError(
-                f"'{tool}' was not found on PATH. "
-                "Please install ffmpeg: https://ffmpeg.org/download.html"
-            )
+            raise RuntimeError("ffmpeg is not installed on the server. Contact support.")
 
 
 @app.on_event("startup")
@@ -104,10 +104,12 @@ async def upload_video(file: UploadFile = File(...)):
     input_path = job_dir / f"input{suffix}"
 
     try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File exceeds the maximum allowed size.")
         with open(input_path, "wb") as f:
-            content = await file.read()
-            if not content:
-                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
             f.write(content)
     except HTTPException:
         raise
@@ -132,13 +134,19 @@ async def upload_video(file: UploadFile = File(...)):
 async def process_video(job_id: str, req: ProcessRequest):
     """Run dead space removal on the uploaded video."""
     if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found. The job may have expired — please upload your video again.")
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
 
     job = jobs[job_id]
     if job["status"] == "processing":
         raise HTTPException(status_code=400, detail="This job is already being processed.")
     if job["status"] == "done":
-        raise HTTPException(status_code=400, detail="This job has already been processed. Download your video or start a new one.")
+        raise HTTPException(
+            status_code=400,
+            detail="This job has already been processed. Download your video or start a new one.",
+        )
     if job["status"] not in ("pending", "error"):
         raise HTTPException(status_code=400, detail=f"Unexpected job state: {job['status']}")
 
@@ -160,8 +168,7 @@ async def process_video(job_id: str, req: ProcessRequest):
 
         if not keep_intervals:
             raise ValueError(
-                "No audio was found above the silence threshold. "
-                "Try lowering the threshold (e.g. -40 dB) or reducing the minimum duration."
+                "Processing failed. Try adjusting your settings and running again."
             )
 
         concat_video(input_path, keep_intervals, str(output_path))
@@ -174,8 +181,11 @@ async def process_video(job_id: str, req: ProcessRequest):
         raise
     except Exception as exc:
         job["status"] = "error"
-        job["error"] = str(exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        job["error"] = "Processing failed. Try adjusting your settings and running again."
+        raise HTTPException(
+            status_code=500,
+            detail="Processing failed. Try adjusting your settings and running again.",
+        )
 
 
 @app.get("/status/{job_id}")
@@ -184,7 +194,7 @@ async def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(
             status_code=404,
-            detail="Job not found. The job may have expired — please upload your video again.",
+            detail="Job not found. It may have expired — please re-upload your video.",
         )
     job = jobs[job_id]
     return {
@@ -200,7 +210,7 @@ async def download_video(job_id: str):
     if job_id not in jobs:
         raise HTTPException(
             status_code=404,
-            detail="Job not found. The job may have expired — please upload and process your video again.",
+            detail="Job not found. It may have expired — please re-upload your video.",
         )
 
     job = jobs[job_id]

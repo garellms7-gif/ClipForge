@@ -4,35 +4,30 @@ import { useState, useCallback, useRef } from "react";
 import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
+import { parseApiError } from "@/lib/api";
 
-const API =
+const BASE =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
-// idle       — nothing selected
-// uploading  — file dropped, POST /upload in flight
-// ready      — upload done, settings visible
-// processing — POST /process sent, polling /status
-// done       — job finished
-// error      — something went wrong
-type Stage = "idle" | "uploading" | "ready" | "processing" | "done" | "error";
+// State machine — exactly these five states:
+//   idle       → no file selected
+//   ready      → file uploaded, job_id stored, settings visible
+//   processing → "Remove Dead Space" clicked, polling /status
+//   done       → job finished, download available
+//   error      → any fetch failed, errorMsg stored
+type Stage = "idle" | "ready" | "processing" | "done" | "error";
 
-/** Extract a human-readable message from a fetch Response error body. */
-async function parseApiError(res: Response, fallback: string): Promise<string> {
-  try {
-    const body = await res.json();
-    return body?.detail ?? body?.message ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
+const DEFAULT_THRESHOLD = -35;
+const DEFAULT_DURATION = 0.5;
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
+  const [isUploading, setIsUploading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string>("");
-  const [thresholdDb, setThresholdDb] = useState<number>(-35);
-  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(0.5);
+  const [thresholdDb, setThresholdDb] = useState<number>(DEFAULT_THRESHOLD);
+  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(DEFAULT_DURATION);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopPolling = () => {
@@ -42,20 +37,21 @@ export default function Home() {
     }
   };
 
-  // Upload fires immediately on file drop/select
+  // File selected → immediately POST /upload; idle until ready or error
   const handleFileSelect = useCallback(async (f: File) => {
     stopPolling();
     setFile(f);
     setJobId(null);
     setErrorMsg("");
-    setStage("uploading");
+    setStage("idle");
+    setIsUploading(true);
 
     try {
       const formData = new FormData();
       formData.append("file", f);
-      const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
+      const res = await fetch(`${BASE}/upload`, { method: "POST", body: formData });
       if (!res.ok) {
-        throw new Error(await parseApiError(res, "Upload failed. Please try again."));
+        throw new Error(await parseApiError(res));
       }
       const { job_id } = await res.json();
       setJobId(job_id);
@@ -63,20 +59,21 @@ export default function Home() {
     } catch (e: unknown) {
       setStage("error");
       setErrorMsg(
-        e instanceof Error
-          ? e.message
-          : "Upload failed. Check your connection and try again."
+        e instanceof Error ? e.message : "Something went wrong. Please try again."
       );
+    } finally {
+      setIsUploading(false);
     }
   }, []);
 
+  // Transitions: ready → processing
   const handleProcess = async () => {
     if (!jobId) return;
     setStage("processing");
     setErrorMsg("");
 
     try {
-      const res = await fetch(`${API}/process/${jobId}`, {
+      const res = await fetch(`${BASE}/process/${jobId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -85,15 +82,13 @@ export default function Home() {
         }),
       });
       if (!res.ok) {
-        throw new Error(
-          await parseApiError(res, "Processing failed. Adjust the settings and try again.")
-        );
+        throw new Error(await parseApiError(res));
       }
 
-      // Poll every 2 s
+      // Poll every 2 s: processing → done | error
       pollRef.current = setInterval(async () => {
         try {
-          const statusRes = await fetch(`${API}/status/${jobId}`);
+          const statusRes = await fetch(`${BASE}/status/${jobId}`);
           if (!statusRes.ok) return; // transient — keep polling
           const { status, error } = await statusRes.json();
           if (status === "done") {
@@ -102,9 +97,7 @@ export default function Home() {
           } else if (status === "error") {
             stopPolling();
             setStage("error");
-            setErrorMsg(
-              error ?? "Processing failed. Adjust the settings and try again."
-            );
+            setErrorMsg(error ?? "Something went wrong. Please try again.");
           }
         } catch {
           // network hiccup — keep polling
@@ -114,24 +107,20 @@ export default function Home() {
       stopPolling();
       setStage("error");
       setErrorMsg(
-        e instanceof Error
-          ? e.message
-          : "An unexpected error occurred. Please try again."
+        e instanceof Error ? e.message : "Something went wrong. Please try again."
       );
     }
   };
 
   const handleDownload = () => {
     if (!jobId) return;
-    window.open(`${API}/download/${jobId}`, "_blank");
+    window.open(`${BASE}/download/${jobId}`, "_blank");
   };
 
-  // "Try Again" — keep the file & jobId, go back to ready so user can tweak settings
+  // error → ready (job exists) | idle (upload failed)
   const handleTryAgain = () => {
     stopPolling();
     setErrorMsg("");
-    // If we have a jobId the file is still on the server; go back to ready.
-    // If the error was during upload (no jobId), go back to idle.
     if (jobId) {
       setStage("ready");
     } else {
@@ -140,21 +129,19 @@ export default function Home() {
     }
   };
 
-  // "Process another video" — full reset
+  // done → idle: full reset including settings back to defaults
   const handleReset = () => {
     stopPolling();
     setFile(null);
     setJobId(null);
     setStage("idle");
     setErrorMsg("");
+    setThresholdDb(DEFAULT_THRESHOLD);
+    setMinSilenceDuration(DEFAULT_DURATION);
   };
 
-  const isWorking = stage === "uploading" || stage === "processing";
-  const showSettings =
-    stage === "ready" ||
-    stage === "processing" ||
-    stage === "done" ||
-    stage === "error";
+  const isWorking = isUploading || stage === "processing";
+  const showSettings = stage === "ready" || stage === "processing" || stage === "done" || stage === "error";
 
   return (
     <main
@@ -194,12 +181,12 @@ export default function Home() {
         {/* Drop zone */}
         <DropZone
           file={file}
-          stage={stage}
+          isUploading={isUploading}
           onFileSelect={handleFileSelect}
           disabled={isWorking}
         />
 
-        {/* Settings — shown once a file is uploaded */}
+        {/* Settings — shown once a file is on the server */}
         {showSettings && (
           <SettingsPanel
             thresholdDb={thresholdDb}
@@ -213,8 +200,7 @@ export default function Home() {
         {/* Status feedback */}
         <StatusBar stage={stage} errorMsg={errorMsg} />
 
-        {/* ── Actions ── */}
-
+        {/* ── done: download + reset ── */}
         {stage === "done" && (
           <div className="flex flex-col gap-3">
             <button
@@ -233,24 +219,33 @@ export default function Home() {
             >
               DOWNLOAD PROCESSED VIDEO
             </button>
+            {/* ghost: white border + white text; hover: white bg + black text */}
             <button
               onClick={handleReset}
-              className="w-full py-3 px-6 text-sm font-medium transition-all"
+              className="w-full py-3 px-6 font-bold text-sm transition-all"
               style={{
-                fontFamily: "'DM Sans', sans-serif",
+                fontFamily: "'Space Mono', monospace",
                 background: "transparent",
-                border: "1px solid var(--border)",
-                color: "var(--text-muted)",
+                border: "1px solid #ffffff",
+                color: "#ffffff",
                 cursor: "pointer",
+                letterSpacing: "0.05em",
               }}
-              onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--border-active)")}
-              onMouseLeave={e => (e.currentTarget.style.borderColor = "var(--border)")}
+              onMouseEnter={e => {
+                e.currentTarget.style.background = "#ffffff";
+                e.currentTarget.style.color = "#000000";
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.color = "#ffffff";
+              }}
             >
-              Process another video
+              PROCESS ANOTHER VIDEO
             </button>
           </div>
         )}
 
+        {/* ── error: try again ── */}
         {stage === "error" && (
           <button
             onClick={handleTryAgain}
@@ -258,18 +253,25 @@ export default function Home() {
             style={{
               fontFamily: "'Space Mono', monospace",
               background: "transparent",
-              border: "1px solid var(--red)",
-              color: "var(--red)",
+              border: "1px solid #ff4444",
+              color: "#ff4444",
               cursor: "pointer",
               letterSpacing: "0.1em",
             }}
-            onMouseEnter={e => (e.currentTarget.style.background = "var(--red-dim)")}
-            onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+            onMouseEnter={e => {
+              e.currentTarget.style.background = "#ff4444";
+              e.currentTarget.style.color = "#ffffff";
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.color = "#ff4444";
+            }}
           >
             TRY AGAIN
           </button>
         )}
 
+        {/* ── ready: process ── */}
         {stage === "ready" && (
           <button
             onClick={handleProcess}
@@ -291,8 +293,8 @@ export default function Home() {
       </div>
 
       <footer
-        className="mt-16 text-xs"
-        style={{ color: "var(--text-dim)", fontFamily: "'DM Sans', sans-serif" }}
+        className="mt-16 text-xs text-center"
+        style={{ color: "#555555", fontFamily: "'DM Sans', sans-serif" }}
       >
         ClipForge &mdash; built for creators
       </footer>
