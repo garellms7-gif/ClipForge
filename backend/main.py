@@ -43,6 +43,14 @@ try:
 except ImportError:
     _STRIPE_AVAILABLE = False
 
+# Optional APScheduler (scheduled publishing)
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler as _BackgroundScheduler
+    from apscheduler.triggers.date import DateTrigger as _DateTrigger
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
@@ -352,6 +360,11 @@ jobs: Dict[str, Dict[str, Any]] = {}
 TEMP_DIR = Path(tempfile.gettempdir()) / "clipforge"
 TEMP_DIR.mkdir(exist_ok=True)
 
+# APScheduler instance (started/stopped in lifespan events)
+_scheduler: Any = None
+if _APSCHEDULER_AVAILABLE:
+    _scheduler = _BackgroundScheduler(timezone="UTC")
+
 
 class ProcessRequest(BaseModel):
     threshold_db: float = -35.0
@@ -391,6 +404,28 @@ class InviteMemberRequest(BaseModel):
 
 class UpdateTeamRequest(BaseModel):
     name: str
+
+
+class YouTubeScheduleSettings(BaseModel):
+    title: str
+    description: str = ""
+    tags: list[str] = []
+    privacy: Literal["public", "unlisted", "private"] = "private"
+    category_id: str = "20"
+
+
+class RumbleScheduleSettings(BaseModel):
+    title: str
+    description: str = ""
+    tags: list[str] = []
+    visibility: str = "public"
+
+
+class SchedulePublishRequest(BaseModel):
+    platforms: list[Literal["youtube", "rumble"]]
+    scheduled_at: str  # ISO 8601, e.g. "2025-04-01T18:00:00Z"
+    youtube_settings: YouTubeScheduleSettings | None = None
+    rumble_settings: RumbleScheduleSettings | None = None
 
 
 class DeadSpaceSettings(BaseModel):
@@ -465,6 +500,46 @@ async def startup_event() -> None:
             check()
         except RuntimeError as exc:
             print(f"\n[ClipForge] WARNING: {exc}\n", file=sys.stderr)
+    if _scheduler is not None:
+        _scheduler.start()
+        print("[ClipForge] APScheduler started.", file=sys.stderr)
+        # Re-hydrate any still-pending scheduled jobs from the DB so they survive
+        # a server restart (best-effort; misfire_grace_time handles missed fires).
+        if supabase_admin is not None:
+            try:
+                rows = (
+                    supabase_admin.table("scheduled_publishes")
+                    .select("id, job_id, user_id, platforms, scheduled_at, youtube_settings, rumble_settings")
+                    .eq("status", "scheduled")
+                    .execute()
+                ).data or []
+                for row in rows:
+                    try:
+                        fire_dt = datetime.fromisoformat(
+                            row["scheduled_at"].replace("Z", "+00:00")
+                        )
+                        if fire_dt > datetime.now(timezone.utc):
+                            _scheduler.add_job(
+                                _do_scheduled_publish,
+                                trigger=_DateTrigger(run_date=fire_dt),
+                                args=[row["id"], row["job_id"], row["user_id"],
+                                      row["platforms"],
+                                      row.get("youtube_settings"),
+                                      row.get("rumble_settings")],
+                                id=row["id"],
+                                replace_existing=True,
+                                misfire_grace_time=3600,
+                            )
+                    except Exception as exc:
+                        print(f"[ClipForge] Could not re-schedule {row['id']}: {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[ClipForge] Scheduler hydration failed: {exc}", file=sys.stderr)
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if _scheduler is not None and _scheduler.running:
+        _scheduler.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2096,269 @@ async def remove_team_member(
         return {"message": "Member removed."}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to remove member: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Scheduled publishing helpers + routes
+# ---------------------------------------------------------------------------
+
+def _do_scheduled_publish(
+    schedule_id: str,
+    job_id: str,
+    user_id: str,
+    platforms: list[str],
+    youtube_settings: dict | None,
+    rumble_settings: dict | None,
+) -> None:
+    """
+    Background job executed by APScheduler at the scheduled time.
+    Calls the same YouTube upload logic as POST /publish/youtube and marks
+    the scheduled_publishes row as 'published' or 'failed'.
+    """
+    import sys
+
+    errors: list[str] = []
+
+    # ── YouTube ──────────────────────────────────────────────────────────────
+    if "youtube" in platforms and youtube_settings:
+        try:
+            # Resolve storage path from in-memory job store, falling back to
+            # a DB lookup (the job may have been evicted from memory).
+            job = jobs.get(job_id)
+            storage_video_path: str | None = None
+            if job:
+                storage_video_path = (
+                    job.get("storage_pipeline_output_path")
+                    or job.get("storage_output_path")
+                    or job.get("storage_respawn_output_path")
+                )
+            if not storage_video_path and supabase_admin:
+                # Best-effort: try to derive path from bucket convention.
+                # We don't have a full DB schema for output paths, so check
+                # common paths.
+                for suffix in ("pipeline.mp4", "processed.mp4"):
+                    candidate = f"{user_id}/{job_id}/{suffix}"
+                    try:
+                        _storage_signed_url(OUTPUT_BUCKET, candidate, expires=60)
+                        storage_video_path = candidate
+                        break
+                    except Exception:
+                        pass
+
+            if not storage_video_path:
+                raise RuntimeError("No processed video found for this job.")
+
+            yt_job_dir = TEMP_DIR / f"{job_id}_sched_yt"
+            yt_job_dir.mkdir(parents=True, exist_ok=True)
+            local_video = yt_job_dir / "upload.mp4"
+            try:
+                _storage_download(OUTPUT_BUCKET, storage_video_path, local_video)
+            except Exception as exc:
+                shutil.rmtree(yt_job_dir, ignore_errors=True)
+                raise RuntimeError(f"Failed to retrieve video: {exc}")
+
+            creds = _load_youtube_creds(user_id)
+            if creds is None:
+                shutil.rmtree(yt_job_dir, ignore_errors=True)
+                raise RuntimeError("YouTube not connected.")
+            if creds.expired and not creds.refresh_token:
+                shutil.rmtree(yt_job_dir, ignore_errors=True)
+                raise RuntimeError("YouTube credentials expired.")
+
+            youtube_client = _google_build("youtube", "v3", credentials=creds)
+            title = youtube_settings.get("title", "ClipForge Video")
+            body = {
+                "snippet": {
+                    "title": title[:100],
+                    "description": youtube_settings.get("description", "")[:5000],
+                    "tags": youtube_settings.get("tags", [])[:500],
+                    "categoryId": youtube_settings.get("category_id", "20"),
+                },
+                "status": {
+                    "privacyStatus": youtube_settings.get("privacy", "private"),
+                },
+            }
+            insert_request = youtube_client.videos().insert(
+                part=",".join(body.keys()),
+                body=body,
+                media_body=_MediaFileUpload(
+                    str(local_video), chunksize=1024 * 1024, resumable=True
+                ),
+            )
+            response = None
+            while response is None:
+                _, response = insert_request.next_chunk()
+            _save_youtube_creds(user_id, creds)
+            shutil.rmtree(yt_job_dir, ignore_errors=True)
+        except Exception as exc:
+            shutil.rmtree(TEMP_DIR / f"{job_id}_sched_yt", ignore_errors=True)
+            errors.append(f"YouTube: {exc}")
+            print(f"[ClipForge] Scheduled YouTube publish failed ({schedule_id}): {exc}", file=sys.stderr)
+
+    # ── Rumble (placeholder — no official API) ────────────────────────────────
+    if "rumble" in platforms:
+        errors.append("Rumble: publishing API not yet available.")
+
+    # ── Update DB status ──────────────────────────────────────────────────────
+    if supabase_admin is None:
+        return
+    final_status = "failed" if errors else "published"
+    try:
+        supabase_admin.table("scheduled_publishes").update({
+            "status": final_status,
+            "error_message": "; ".join(errors) if errors else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", schedule_id).execute()
+    except Exception as exc:
+        print(f"[ClipForge] Could not update schedule status ({schedule_id}): {exc}", file=sys.stderr)
+
+
+@app.post("/publish/schedule/{job_id}")
+async def create_schedule(
+    job_id: str,
+    req: SchedulePublishRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Schedule a video for future publishing to one or more platforms."""
+    if not req.platforms:
+        raise HTTPException(status_code=400, detail="At least one platform is required.")
+
+    # Validate the job belongs to this user
+    _assert_job_owner(job_id, user_id)
+
+    # Parse and validate the scheduled time
+    try:
+        fire_dt = datetime.fromisoformat(req.scheduled_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scheduled_at format. Use ISO 8601, e.g. 2025-04-01T18:00:00Z",
+        )
+    if fire_dt <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="scheduled_at must be in the future.")
+
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+
+    yt_dict = req.youtube_settings.model_dump() if req.youtube_settings else None
+    rum_dict = req.rumble_settings.model_dump() if req.rumble_settings else None
+
+    try:
+        row = supabase_admin.table("scheduled_publishes").insert({
+            "job_id": job_id,
+            "user_id": user_id,
+            "platforms": req.platforms,
+            "scheduled_at": fire_dt.isoformat(),
+            "status": "scheduled",
+            "youtube_settings": yt_dict,
+            "rumble_settings": rum_dict,
+        }).execute()
+        schedule_id: str = row.data[0]["id"]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save schedule: {exc}")
+
+    # Register APScheduler job if available
+    if _scheduler is not None:
+        try:
+            _scheduler.add_job(
+                _do_scheduled_publish,
+                trigger=_DateTrigger(run_date=fire_dt),
+                args=[schedule_id, job_id, user_id, req.platforms, yt_dict, rum_dict],
+                id=schedule_id,
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+        except Exception as exc:
+            import sys
+            print(f"[ClipForge] APScheduler add_job failed: {exc}", file=sys.stderr)
+
+    return {
+        "schedule_id": schedule_id,
+        "job_id": job_id,
+        "platforms": req.platforms,
+        "scheduled_at": fire_dt.isoformat(),
+        "status": "scheduled",
+    }
+
+
+@app.get("/publish/schedule")
+async def list_schedules(user_id: str = Depends(get_current_user_id)):
+    """List all scheduled and past publish records for the current user."""
+    if supabase_admin is None:
+        return {"schedules": []}
+    try:
+        resp = (
+            supabase_admin.table("scheduled_publishes")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("scheduled_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        schedules = []
+        for row in (resp.data or []):
+            # Attach filename from in-memory store if available
+            mem_job = jobs.get(str(row.get("job_id", "")), {})
+            schedules.append({
+                "id": row["id"],
+                "job_id": row["job_id"],
+                "filename": mem_job.get("filename", ""),
+                "platforms": row.get("platforms", []),
+                "scheduled_at": row["scheduled_at"],
+                "status": row["status"],
+                "error_message": row.get("error_message"),
+                "created_at": row.get("created_at"),
+            })
+        return {"schedules": schedules}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list schedules: {exc}")
+
+
+@app.delete("/publish/schedule/{schedule_id}")
+async def cancel_schedule(
+    schedule_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Cancel a pending scheduled publish. No-op if already fired."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    try:
+        row_resp = (
+            supabase_admin.table("scheduled_publishes")
+            .select("user_id, status")
+            .eq("id", schedule_id)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if not row_resp.data:
+        raise HTTPException(status_code=404, detail="Schedule not found.")
+    if row_resp.data["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Schedule not found.")
+    if row_resp.data["status"] != "scheduled":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel a schedule with status '{row_resp.data['status']}'.",
+        )
+
+    try:
+        supabase_admin.table("scheduled_publishes").update({
+            "status": "cancelled",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", schedule_id).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to cancel schedule: {exc}")
+
+    # Remove from APScheduler if not yet fired
+    if _scheduler is not None:
+        try:
+            _scheduler.remove_job(schedule_id)
+        except Exception:
+            pass  # Already fired or not found — safe to ignore
+
+    return {"message": "Schedule cancelled."}
 
 
 # ---------------------------------------------------------------------------

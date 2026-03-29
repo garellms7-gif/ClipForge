@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-export type YouTubePublishStage = "idle" | "publishing" | "published" | "error";
+export type YouTubePublishStage = "idle" | "publishing" | "published" | "error" | "scheduling" | "scheduled";
 
 interface YouTubePanelProps {
   connected: boolean;
@@ -18,13 +18,44 @@ interface YouTubePanelProps {
     tags: string[];
     privacy: "private" | "unlisted" | "public";
   }) => void;
+  onSchedule: (params: {
+    title: string;
+    description: string;
+    tags: string[];
+    privacy: "private" | "unlisted" | "public";
+    scheduledAt: string; // ISO 8601
+  }) => void;
   onRetry: () => void;
+  scheduledConfirmation: string; // e.g. "Scheduled for April 1 at 6:00 PM"
   disabled: boolean;
 }
 
 const YOUTUBE_RED = "#FF0000";
 const YOUTUBE_RED_DIM = "rgba(255,0,0,0.08)";
 const YOUTUBE_RED_BORDER = "rgba(255,0,0,0.3)";
+
+/** Format a local datetime-local value to a human-readable string. */
+function formatScheduledLabel(isoLocal: string): string {
+  if (!isoLocal) return "";
+  try {
+    const d = new Date(isoLocal);
+    return d.toLocaleString(undefined, {
+      month: "long",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoLocal;
+  }
+}
+
+/** Return the minimum value for <input type="datetime-local"> — 1 minute from now. */
+function minDatetimeLocal(): string {
+  const d = new Date(Date.now() + 60_000);
+  // Format: YYYY-MM-DDTHH:MM
+  return d.toISOString().slice(0, 16);
+}
 
 export default function YouTubePanel({
   connected,
@@ -35,13 +66,17 @@ export default function YouTubePanel({
   defaultTitle,
   onConnect,
   onPublish,
+  onSchedule,
   onRetry,
+  scheduledConfirmation,
   disabled,
 }: YouTubePanelProps) {
   const [title, setTitle] = useState(defaultTitle);
   const [description, setDescription] = useState("");
   const [tagsInput, setTagsInput] = useState("");
   const [privacy, setPrivacy] = useState<"private" | "unlisted" | "public">("private");
+  const [scheduleMode, setScheduleMode] = useState(false);
+  const [scheduledAt, setScheduledAt] = useState("");
 
   const labelStyle: React.CSSProperties = {
     fontFamily: "'Space Mono', monospace",
@@ -64,12 +99,25 @@ export default function YouTubePanel({
     boxSizing: "border-box",
   };
 
+  const isWorking = stage === "publishing" || stage === "scheduling";
+
   const handleSubmit = () => {
-    const tags = tagsInput
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-    onPublish({ title: title.trim() || defaultTitle, description, tags, privacy });
+    const tags = tagsInput.split(",").map((t) => t.trim()).filter(Boolean);
+    const resolvedTitle = title.trim() || defaultTitle;
+    if (scheduleMode) {
+      if (!scheduledAt) return;
+      // Convert local datetime-local value to UTC ISO string
+      const utcIso = new Date(scheduledAt).toISOString();
+      onSchedule({ title: resolvedTitle, description, tags, privacy, scheduledAt: utcIso });
+    } else {
+      onPublish({ title: resolvedTitle, description, tags, privacy });
+    }
+  };
+
+  const buttonLabel = () => {
+    if (stage === "publishing") return "UPLOADING...";
+    if (stage === "scheduling") return "SCHEDULING...";
+    return scheduleMode ? "SCHEDULE" : "PUBLISH TO YOUTUBE";
   };
 
   return (
@@ -85,7 +133,6 @@ export default function YouTubePanel({
     >
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        {/* YouTube icon */}
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
           <rect x="2" y="5" width="20" height="14" rx="3" fill={YOUTUBE_RED} />
           <polygon points="10,8.5 10,15.5 16,12" fill="#fff" />
@@ -134,12 +181,8 @@ export default function YouTubePanel({
               cursor: disabled ? "not-allowed" : "pointer",
               alignSelf: "flex-start",
             }}
-            onMouseEnter={(e) => {
-              if (!disabled) e.currentTarget.style.opacity = "0.85";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.opacity = "1";
-            }}
+            onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.opacity = "0.85"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
           >
             CONNECT YOUTUBE
           </button>
@@ -151,14 +194,7 @@ export default function YouTubePanel({
         <>
           {/* Connected indicator */}
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <div
-              style={{
-                width: 6,
-                height: 6,
-                borderRadius: "50%",
-                background: "var(--green)",
-              }}
-            />
+            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--green)" }} />
             <span
               style={{
                 fontFamily: "'Space Mono', monospace",
@@ -183,28 +219,33 @@ export default function YouTubePanel({
                 border: "1px solid var(--green-border)",
               }}
             >
-              <span
-                style={{
-                  fontFamily: "'Space Mono', monospace",
-                  fontSize: 11,
-                  color: "var(--green)",
-                }}
-              >
+              <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "var(--green)" }}>
                 VIDEO PUBLISHED
               </span>
               <a
                 href={youtubeUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                style={{
-                  fontFamily: "'DM Sans', sans-serif",
-                  fontSize: 13,
-                  color: YOUTUBE_RED,
-                  wordBreak: "break-all",
-                }}
+                style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 13, color: YOUTUBE_RED, wordBreak: "break-all" }}
               >
                 {youtubeUrl}
               </a>
+            </div>
+          )}
+
+          {/* Scheduled confirmation state */}
+          {stage === "scheduled" && (
+            <div
+              style={{
+                padding: "12px 14px",
+                background: "rgba(255,190,0,0.08)",
+                border: "1px solid rgba(255,190,0,0.3)",
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 11,
+                color: "#FFBE00",
+              }}
+            >
+              {scheduledConfirmation || "SCHEDULED"}
             </div>
           )}
 
@@ -236,22 +277,16 @@ export default function YouTubePanel({
                   color: "var(--red)",
                   cursor: "pointer",
                 }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "var(--red)";
-                  e.currentTarget.style.color = "#fff";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "transparent";
-                  e.currentTarget.style.color = "var(--red)";
-                }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "var(--red)"; e.currentTarget.style.color = "#fff"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--red)"; }}
               >
                 RETRY
               </button>
             </div>
           )}
 
-          {/* Publish form (idle or publishing) */}
-          {(stage === "idle" || stage === "publishing") && (
+          {/* Publish form (idle or working) */}
+          {(stage === "idle" || stage === "publishing" || stage === "scheduling") && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {/* Title */}
               <div>
@@ -261,7 +296,7 @@ export default function YouTubePanel({
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   placeholder={defaultTitle}
-                  disabled={stage === "publishing"}
+                  disabled={isWorking}
                   style={inputStyle}
                 />
               </div>
@@ -273,7 +308,7 @@ export default function YouTubePanel({
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="Optional description..."
-                  disabled={stage === "publishing"}
+                  disabled={isWorking}
                   rows={3}
                   style={{ ...inputStyle, resize: "vertical" }}
                 />
@@ -287,7 +322,7 @@ export default function YouTubePanel({
                   value={tagsInput}
                   onChange={(e) => setTagsInput(e.target.value)}
                   placeholder="gaming, highlight, clip"
-                  disabled={stage === "publishing"}
+                  disabled={isWorking}
                   style={inputStyle}
                 />
               </div>
@@ -297,15 +332,9 @@ export default function YouTubePanel({
                 <label style={labelStyle}>PRIVACY</label>
                 <select
                   value={privacy}
-                  onChange={(e) =>
-                    setPrivacy(e.target.value as "private" | "unlisted" | "public")
-                  }
-                  disabled={stage === "publishing"}
-                  style={{
-                    ...inputStyle,
-                    appearance: "none",
-                    cursor: stage === "publishing" ? "not-allowed" : "pointer",
-                  }}
+                  onChange={(e) => setPrivacy(e.target.value as "private" | "unlisted" | "public")}
+                  disabled={isWorking}
+                  style={{ ...inputStyle, appearance: "none", cursor: isWorking ? "not-allowed" : "pointer" }}
                 >
                   <option value="private">Private</option>
                   <option value="unlisted">Unlisted</option>
@@ -313,10 +342,73 @@ export default function YouTubePanel({
                 </select>
               </div>
 
+              {/* Schedule toggle */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <button
+                  onClick={() => setScheduleMode((v) => !v)}
+                  disabled={isWorking}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "6px 12px",
+                    fontFamily: "'Space Mono', monospace",
+                    fontSize: 10,
+                    letterSpacing: "0.1em",
+                    background: scheduleMode ? "rgba(255,190,0,0.12)" : "transparent",
+                    border: scheduleMode ? "1px solid rgba(255,190,0,0.4)" : "1px solid var(--border)",
+                    color: scheduleMode ? "#FFBE00" : "var(--text-dim)",
+                    cursor: isWorking ? "not-allowed" : "pointer",
+                  }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+                    <circle cx="6" cy="6" r="5" stroke="currentColor" strokeWidth="1.2" />
+                    <path d="M6 3.5V6L7.5 7.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+                  </svg>
+                  SCHEDULE
+                </button>
+                {scheduleMode && (
+                  <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 9, color: "var(--text-dim)" }}>
+                    pick a date &amp; time below
+                  </span>
+                )}
+              </div>
+
+              {/* Datetime picker — shown when schedule mode is on */}
+              {scheduleMode && (
+                <div>
+                  <label style={labelStyle}>PUBLISH DATE &amp; TIME (your local time)</label>
+                  <input
+                    type="datetime-local"
+                    value={scheduledAt}
+                    min={minDatetimeLocal()}
+                    onChange={(e) => setScheduledAt(e.target.value)}
+                    disabled={isWorking}
+                    style={{
+                      ...inputStyle,
+                      colorScheme: "dark",
+                    }}
+                  />
+                  {scheduledAt && (
+                    <span
+                      style={{
+                        fontFamily: "'Space Mono', monospace",
+                        fontSize: 9,
+                        color: "#FFBE00",
+                        marginTop: 5,
+                        display: "block",
+                      }}
+                    >
+                      Will publish {formatScheduledLabel(scheduledAt)}
+                    </span>
+                  )}
+                </div>
+              )}
+
               {/* Submit */}
               <button
                 onClick={handleSubmit}
-                disabled={disabled || stage === "publishing"}
+                disabled={disabled || isWorking || (scheduleMode && !scheduledAt)}
                 style={{
                   width: "100%",
                   padding: "11px 16px",
@@ -325,24 +417,35 @@ export default function YouTubePanel({
                   fontWeight: 700,
                   letterSpacing: "0.1em",
                   background:
-                    disabled || stage === "publishing" ? YOUTUBE_RED_DIM : YOUTUBE_RED,
-                  color: disabled || stage === "publishing" ? YOUTUBE_RED : "#fff",
+                    disabled || isWorking || (scheduleMode && !scheduledAt)
+                      ? YOUTUBE_RED_DIM
+                      : scheduleMode
+                      ? "rgba(255,190,0,0.15)"
+                      : YOUTUBE_RED,
+                  color:
+                    disabled || isWorking || (scheduleMode && !scheduledAt)
+                      ? YOUTUBE_RED
+                      : scheduleMode
+                      ? "#FFBE00"
+                      : "#fff",
                   border:
-                    disabled || stage === "publishing"
+                    disabled || isWorking || (scheduleMode && !scheduledAt)
                       ? `1px solid ${YOUTUBE_RED_BORDER}`
+                      : scheduleMode
+                      ? "1px solid rgba(255,190,0,0.4)"
                       : "none",
                   cursor:
-                    disabled || stage === "publishing" ? "not-allowed" : "pointer",
+                    disabled || isWorking || (scheduleMode && !scheduledAt)
+                      ? "not-allowed"
+                      : "pointer",
                 }}
                 onMouseEnter={(e) => {
-                  if (!disabled && stage !== "publishing")
+                  if (!disabled && !isWorking && !(scheduleMode && !scheduledAt))
                     e.currentTarget.style.opacity = "0.85";
                 }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.opacity = "1";
-                }}
+                onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
               >
-                {stage === "publishing" ? "UPLOADING..." : "PUBLISH TO YOUTUBE"}
+                {buttonLabel()}
               </button>
             </div>
           )}

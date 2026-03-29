@@ -181,6 +181,7 @@ export default function Home() {
   const [youtubePublishStage, setYoutubePublishStage] = useState<YouTubePublishStage>("idle");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [youtubeErrorMsg, setYoutubeErrorMsg] = useState("");
+  const [youtubeScheduledConfirmation, setYoutubeScheduledConfirmation] = useState("");
   const youtubePopupRef = useRef<Window | null>(null);
 
   // ── Hype state ──
@@ -369,6 +370,51 @@ export default function Home() {
     setYoutubePublishStage("idle");
     setYoutubeErrorMsg("");
     setYoutubeUrl("");
+    setYoutubeScheduledConfirmation("");
+  };
+
+  const handleScheduleYouTube = async (params: {
+    title: string;
+    description: string;
+    tags: string[];
+    privacy: "private" | "unlisted" | "public";
+    scheduledAt: string;
+  }) => {
+    if (!jobId) return;
+    setYoutubePublishStage("scheduling");
+    setYoutubeErrorMsg("");
+    try {
+      const res = await fetch(`${BASE}/publish/schedule/${jobId}`, {
+        method: "POST",
+        headers: await getHeaders(),
+        body: JSON.stringify({
+          platforms: ["youtube"],
+          scheduled_at: params.scheduledAt,
+          youtube_settings: {
+            title: params.title,
+            description: params.description,
+            tags: params.tags,
+            privacy: params.privacy,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(await parseApiError(res));
+      const data = await res.json();
+      const fireDate = new Date(data.scheduled_at);
+      const label = fireDate.toLocaleString(undefined, {
+        month: "long",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      setYoutubeScheduledConfirmation(`SCHEDULED FOR ${label.toUpperCase()}`);
+      setYoutubePublishStage("scheduled");
+    } catch (e: unknown) {
+      setYoutubePublishStage("error");
+      setYoutubeErrorMsg(
+        e instanceof Error ? e.message : "Scheduling failed. Please try again."
+      );
+    }
   };
 
   // ─────────────────────────────────────────────────────────
@@ -404,6 +450,7 @@ export default function Home() {
     setYoutubePublishStage("idle");
     setYoutubeUrl("");
     setYoutubeErrorMsg("");
+    setYoutubeScheduledConfirmation("");
     setYoutubeConnectionChecked(false);
 
     try {
@@ -1197,7 +1244,9 @@ export default function Home() {
             defaultTitle={file?.name.replace(/\.[^.]+$/, "") ?? "My ClipForge Video"}
             onConnect={handleConnectYouTube}
             onPublish={handlePublishYouTube}
+            onSchedule={handleScheduleYouTube}
             onRetry={handleYoutubeRetry}
+            scheduledConfirmation={youtubeScheduledConfirmation}
             disabled={isWorking}
           />
         )}
