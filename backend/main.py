@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Literal
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends, Query
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -230,6 +230,71 @@ def _increment_video_count(user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Team helpers
+# ---------------------------------------------------------------------------
+
+TEAM_SEAT_LIMIT = 5
+
+
+def _assert_team_member_db(team_id: str, user_id: str) -> Dict[str, Any]:
+    """Assert user is a member of the team. Returns team+role dict or raises 404."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    try:
+        member_resp = (
+            supabase_admin.table("team_members")
+            .select("role")
+            .eq("team_id", team_id)
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        if not member_resp.data:
+            raise HTTPException(status_code=404, detail="Team not found.")
+        team_resp = (
+            supabase_admin.table("teams")
+            .select("*")
+            .eq("id", team_id)
+            .maybe_single()
+            .execute()
+        )
+        if not team_resp.data:
+            raise HTTPException(status_code=404, detail="Team not found.")
+        return {**team_resp.data, "role": member_resp.data["role"]}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+def _assert_team_owner_db(team_id: str, user_id: str) -> Dict[str, Any]:
+    """Assert user is the owner of the team. Returns team dict or raises 403."""
+    team = _assert_team_member_db(team_id, user_id)
+    if team.get("owner_id") != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the team owner can perform this action.",
+        )
+    return team
+
+
+def _get_team_member_count(team_id: str) -> int:
+    """Return current member count for the team."""
+    if supabase_admin is None:
+        return 0
+    try:
+        resp = (
+            supabase_admin.table("team_members")
+            .select("user_id", count="exact")
+            .eq("team_id", team_id)
+            .execute()
+        )
+        return resp.count or 0
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Supabase Storage helpers
 # ---------------------------------------------------------------------------
 
@@ -314,6 +379,18 @@ class YouTubePublishRequest(BaseModel):
 
 class CheckoutRequest(BaseModel):
     plan: Literal["creator", "team"]
+
+
+class CreateTeamRequest(BaseModel):
+    name: str
+
+
+class InviteMemberRequest(BaseModel):
+    email: str
+
+
+class UpdateTeamRequest(BaseModel):
+    name: str
 
 
 class DeadSpaceSettings(BaseModel):
@@ -409,9 +486,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 @app.post("/upload")
 async def upload_video(
     file: UploadFile = File(...),
+    team_id: str | None = Form(default=None),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Accept a video file, save to temp storage, return job_id."""
+    """Accept a video file, upload to Supabase Storage, return job_id."""
     try:
         _check_ffmpeg()
     except RuntimeError as exc:
@@ -427,6 +505,10 @@ async def upload_video(
             status_code=403,
             detail="Monthly limit reached. Upgrade to Creator for unlimited videos.",
         )
+
+    # If uploading to a team workspace, verify membership
+    if team_id:
+        _assert_team_member_db(team_id, user_id)
 
     job_id = str(uuid.uuid4())
     job_dir = TEMP_DIR / job_id
@@ -470,6 +552,7 @@ async def upload_video(
     jobs[job_id] = {
         "status": "pending",
         "user_id": user_id,
+        "team_id": team_id,
         "storage_input_path": storage_input_path,
         "storage_output_path": None,
         "storage_respawn_output_path": None,
@@ -494,7 +577,7 @@ async def upload_video(
         "pipeline_error": None,
     }
 
-    _db_write(job_id, {"user_id": user_id, "status": "pending", "settings": {}, "summary": None})
+    _db_write(job_id, {"user_id": user_id, "team_id": team_id, "status": "pending", "settings": {}, "summary": None})
     _increment_video_count(user_id)
     return {"job_id": job_id}
 
@@ -1696,6 +1779,248 @@ async def publish_to_youtube(
             status_code=500,
             detail="YouTube upload failed. Please try again or check your YouTube channel settings.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Team routes
+# ---------------------------------------------------------------------------
+
+@app.post("/teams")
+async def create_team(
+    req: CreateTeamRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Create a new team workspace. Requires Team plan."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    plan, _ = _get_usage(user_id)
+    if plan != "team":
+        raise HTTPException(
+            status_code=403,
+            detail="Team workspaces require the Team plan. Upgrade at /billing.",
+        )
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Team name cannot be empty.")
+    try:
+        team_resp = supabase_admin.table("teams").insert({
+            "name": name,
+            "owner_id": user_id,
+        }).execute()
+        team = team_resp.data[0]
+        team_id = team["id"]
+        supabase_admin.table("team_members").insert({
+            "team_id": team_id,
+            "user_id": user_id,
+            "role": "owner",
+        }).execute()
+        return {"id": team_id, "name": name, "role": "owner"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create team: {exc}")
+
+
+@app.get("/teams")
+async def list_teams(user_id: str = Depends(get_current_user_id)):
+    """List all teams the authenticated user belongs to."""
+    if supabase_admin is None:
+        return {"teams": []}
+    try:
+        resp = (
+            supabase_admin.table("team_members")
+            .select("role, teams(id, name, owner_id)")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        teams = []
+        for row in (resp.data or []):
+            t = row.get("teams") or {}
+            if t.get("id"):
+                teams.append({
+                    "id": t["id"],
+                    "name": t["name"],
+                    "owner_id": t.get("owner_id"),
+                    "role": row.get("role", "member"),
+                })
+        return {"teams": teams}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list teams: {exc}")
+
+
+@app.get("/teams/{team_id}")
+async def get_team(team_id: str, user_id: str = Depends(get_current_user_id)):
+    """Return team info and full member list. Requires membership."""
+    _assert_team_member_db(team_id, user_id)
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    try:
+        team_resp = (
+            supabase_admin.table("teams").select("*").eq("id", team_id).maybe_single().execute()
+        )
+        if not team_resp.data:
+            raise HTTPException(status_code=404, detail="Team not found.")
+
+        members_resp = (
+            supabase_admin.table("team_members")
+            .select("user_id, role, joined_at")
+            .eq("team_id", team_id)
+            .execute()
+        )
+        members = []
+        for m in (members_resp.data or []):
+            try:
+                u = supabase_admin.auth.admin.get_user_by_id(m["user_id"])
+                email = u.user.email if u.user else ""
+            except Exception:
+                email = ""
+            members.append({
+                "user_id": m["user_id"],
+                "email": email,
+                "role": m["role"],
+                "joined_at": m["joined_at"],
+            })
+
+        return {
+            "id": team_resp.data["id"],
+            "name": team_resp.data["name"],
+            "owner_id": team_resp.data["owner_id"],
+            "created_at": team_resp.data["created_at"],
+            "members": members,
+            "seat_limit": TEAM_SEAT_LIMIT,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to get team: {exc}")
+
+
+@app.patch("/teams/{team_id}")
+async def update_team(
+    team_id: str,
+    req: UpdateTeamRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Rename a team. Owner only."""
+    _assert_team_owner_db(team_id, user_id)
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Team name cannot be empty.")
+    try:
+        supabase_admin.table("teams").update({"name": name}).eq("id", team_id).execute()
+        return {"id": team_id, "name": name}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update team: {exc}")
+
+
+@app.post("/teams/{team_id}/invite")
+async def invite_team_member(
+    team_id: str,
+    req: InviteMemberRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Invite a user by email. Owner only. Enforces 5-seat limit."""
+    _assert_team_owner_db(team_id, user_id)
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+
+    current_count = _get_team_member_count(team_id)
+    if current_count >= TEAM_SEAT_LIMIT:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Seat limit reached ({TEAM_SEAT_LIMIT} members maximum).",
+        )
+    try:
+        # invite_user_by_email returns the user (creates if new, reuses if existing)
+        invite_resp = supabase_admin.auth.admin.invite_user_by_email(req.email)
+        invited_uid = str(invite_resp.user.id)
+
+        existing = (
+            supabase_admin.table("team_members")
+            .select("user_id")
+            .eq("team_id", team_id)
+            .eq("user_id", invited_uid)
+            .maybe_single()
+            .execute()
+        )
+        if existing.data:
+            raise HTTPException(
+                status_code=400, detail="User is already a member of this team."
+            )
+        supabase_admin.table("team_members").insert({
+            "team_id": team_id,
+            "user_id": invited_uid,
+            "role": "member",
+        }).execute()
+        return {"message": f"Invite sent to {req.email}."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to send invite: {exc}")
+
+
+@app.get("/teams/{team_id}/jobs")
+async def list_team_jobs(team_id: str, user_id: str = Depends(get_current_user_id)):
+    """List jobs associated with a team workspace."""
+    _assert_team_member_db(team_id, user_id)
+
+    db_jobs: list[Dict[str, Any]] = []
+    if supabase_admin is not None:
+        try:
+            resp = (
+                supabase_admin.table("jobs")
+                .select("id, status, created_at, summary")
+                .eq("team_id", team_id)
+                .order("created_at", desc=True)
+                .limit(50)
+                .execute()
+            )
+            db_jobs = resp.data or []
+        except Exception:
+            pass
+
+    result = []
+    seen: set[str] = set()
+    for db_job in db_jobs:
+        jid = db_job["id"]
+        seen.add(jid)
+        mem = jobs.get(jid, {})
+        result.append({
+            "job_id": jid,
+            "status": mem.get("status") or db_job.get("status", "unknown"),
+            "filename": mem.get("filename", ""),
+            "created_at": db_job.get("created_at"),
+        })
+    # Include in-memory-only jobs not yet persisted to DB
+    for jid, j in jobs.items():
+        if j.get("team_id") == team_id and jid not in seen:
+            result.append({
+                "job_id": jid,
+                "status": j.get("status", "unknown"),
+                "filename": j.get("filename", ""),
+                "created_at": None,
+            })
+
+    return {"jobs": result}
+
+
+@app.delete("/teams/{team_id}/members/{member_user_id}")
+async def remove_team_member(
+    team_id: str,
+    member_user_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Remove a member from a team. Owner only. Cannot remove the owner."""
+    team = _assert_team_owner_db(team_id, user_id)
+    if member_user_id == team["owner_id"]:
+        raise HTTPException(status_code=400, detail="Cannot remove the team owner.")
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+    try:
+        supabase_admin.table("team_members").delete().eq(
+            "team_id", team_id
+        ).eq("user_id", member_user_id).execute()
+        return {"message": "Member removed."}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to remove member: {exc}")
 
 
 # ---------------------------------------------------------------------------

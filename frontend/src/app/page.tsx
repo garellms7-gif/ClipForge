@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
-import TopBar from "@/components/TopBar";
+import TopBar, { type Team } from "@/components/TopBar";
 import RespawnPanel, { type RespawnStage, type RespawnStats } from "@/components/RespawnPanel";
 import HypePanel, { type HypeStage, type HypeMoment } from "@/components/HypePanel";
 import PipelinePanel, {
@@ -51,6 +51,14 @@ export default function Home() {
   const [billingVideosUsed, setBillingVideosUsed] = useState<number>(0);
   const [billingLimit, setBillingLimit] = useState<number | null>(3);
 
+  // ── Teams / workspace state ──
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [activeTeamId, setActiveTeamId] = useState<string | null>(null);
+  const [showCreateTeam, setShowCreateTeam] = useState(false);
+  const [newTeamName, setNewTeamName] = useState("");
+  const [creatingTeam, setCreatingTeam] = useState(false);
+  const [createTeamError, setCreateTeamError] = useState("");
+
   useEffect(() => {
     // Check session on mount; redirect to /auth if unauthenticated
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -59,10 +67,9 @@ export default function Home() {
       } else {
         setUserEmail(session.user.email ?? "");
         setIsAuthChecked(true);
-        // Fetch billing status in the background
-        fetch(`${BASE}/billing/status`, {
-          headers: { Authorization: `Bearer ${session.access_token}` },
-        })
+        // Fetch billing status and teams in the background
+        const token = session.access_token;
+        fetch(`${BASE}/billing/status`, { headers: { Authorization: `Bearer ${token}` } })
           .then((r) => r.ok ? r.json() : null)
           .then((data) => {
             if (data) {
@@ -70,6 +77,12 @@ export default function Home() {
               setBillingVideosUsed(data.videos_this_month ?? 0);
               setBillingLimit(data.limit ?? null);
             }
+          })
+          .catch(() => undefined);
+        fetch(`${BASE}/teams`, { headers: { Authorization: `Bearer ${token}` } })
+          .then((r) => r.ok ? r.json() : null)
+          .then((data) => {
+            if (data?.teams) setTeams(data.teams as Team[]);
           })
           .catch(() => undefined);
       }
@@ -238,6 +251,66 @@ export default function Home() {
   };
 
   // ─────────────────────────────────────────────────────────
+  // Team / workspace helpers
+  // ─────────────────────────────────────────────────────────
+
+  const handleWorkspaceChange = (teamId: string | null) => {
+    setActiveTeamId(teamId);
+    // Reset job state so the new workspace starts clean
+    stopPolling();
+    stopPipelinePolling();
+    setFile(null);
+    setJobId(null);
+    setStage("idle");
+    setErrorMsg("");
+    setRespawnStage("idle");
+    setRespawnStats(null);
+    setRespawnErrorMsg("");
+    setHypeStage("idle");
+    setHypeMoments([]);
+    setHypeErrorMsg("");
+    setPipelineStage("idle");
+    setPipelineCurrentStep(null);
+    setPipelineStepsCompleted([]);
+    setPipelinePercent(0);
+    setPipelineSummary(null);
+    setPipelineHasVideoOutput(false);
+    setPipelineErrorMsg("");
+    setYoutubePublishStage("idle");
+    setYoutubeUrl("");
+    setYoutubeErrorMsg("");
+    setYoutubeConnectionChecked(false);
+  };
+
+  const handleCreateTeam = async () => {
+    const name = newTeamName.trim();
+    if (!name) return;
+    setCreatingTeam(true);
+    setCreateTeamError("");
+    try {
+      const res = await fetch(`${BASE}/teams`, {
+        method: "POST",
+        headers: await getHeaders(),
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        setCreateTeamError(d.detail ?? "Failed to create team.");
+        return;
+      }
+      const team = await res.json();
+      setTeams((prev) => [...prev, { id: team.id, name: team.name, role: "owner" }]);
+      setActiveTeamId(team.id);
+      setShowCreateTeam(false);
+      setNewTeamName("");
+    } catch {
+      setCreateTeamError("Network error. Please try again.");
+    } finally {
+      setCreatingTeam(false);
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────
   // YouTube helpers
   // ─────────────────────────────────────────────────────────
 
@@ -336,6 +409,7 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append("file", f);
+      if (activeTeamId) formData.append("team_id", activeTeamId);
       // No Content-Type — browser sets multipart boundary automatically
       const uploadHeaders = await getHeaders(false);
       const res = await fetch(`${BASE}/upload`, {
@@ -685,7 +759,122 @@ export default function Home() {
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100vh" }}>
-      <TopBar userEmail={userEmail} onSignOut={handleSignOut} />
+      <TopBar
+        userEmail={userEmail}
+        onSignOut={handleSignOut}
+        teams={teams}
+        activeTeamId={activeTeamId}
+        billingPlan={billingPlan}
+        onWorkspaceChange={handleWorkspaceChange}
+        onCreateTeam={() => { setCreateTeamError(""); setShowCreateTeam(true); }}
+      />
+
+      {/* Create Team modal */}
+      {showCreateTeam && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.7)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 200,
+            padding: 24,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowCreateTeam(false); }}
+        >
+          <div
+            style={{
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              padding: "28px 28px 24px",
+              width: "100%",
+              maxWidth: 400,
+              display: "flex",
+              flexDirection: "column",
+              gap: 16,
+            }}
+          >
+            <h2
+              style={{
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 13,
+                fontWeight: 700,
+                letterSpacing: "0.15em",
+                color: "var(--text)",
+                margin: 0,
+              }}
+            >
+              CREATE TEAM
+            </h2>
+            <input
+              autoFocus
+              type="text"
+              value={newTeamName}
+              onChange={(e) => setNewTeamName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleCreateTeam(); }}
+              placeholder="Team name"
+              style={{
+                padding: "9px 12px",
+                background: "var(--surface-2)",
+                border: "1px solid var(--border)",
+                color: "var(--text)",
+                fontFamily: "'DM Sans', sans-serif",
+                fontSize: 14,
+                outline: "none",
+              }}
+            />
+            {createTeamError && (
+              <p
+                style={{
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: 10,
+                  color: "var(--red)",
+                  margin: 0,
+                }}
+              >
+                {createTeamError}
+              </p>
+            )}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={handleCreateTeam}
+                disabled={creatingTeam || !newTeamName.trim()}
+                style={{
+                  flex: 1,
+                  padding: "10px 0",
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  background: creatingTeam ? "var(--green-dim)" : "var(--green)",
+                  color: creatingTeam ? "var(--green)" : "#000",
+                  border: "none",
+                  cursor: creatingTeam ? "not-allowed" : "pointer",
+                }}
+              >
+                {creatingTeam ? "CREATING..." : "CREATE"}
+              </button>
+              <button
+                onClick={() => setShowCreateTeam(false)}
+                style={{
+                  padding: "10px 18px",
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: 11,
+                  letterSpacing: "0.08em",
+                  background: "transparent",
+                  border: "1px solid var(--border)",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                }}
+              >
+                CANCEL
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Usage banner — shown only on Free plan */}
       {billingPlan === "free" && billingLimit !== null && (
@@ -727,6 +916,49 @@ export default function Home() {
           </a>
         </div>
       )}
+
+      {/* Team workspace context banner */}
+      {activeTeamId && (() => {
+        const t = teams.find((x) => x.id === activeTeamId);
+        return t ? (
+          <div
+            style={{
+              background: "var(--green-dim)",
+              borderBottom: "1px solid var(--green-border)",
+              padding: "7px 20px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+            }}
+          >
+            <span
+              style={{
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 10,
+                letterSpacing: "0.1em",
+                color: "var(--green)",
+              }}
+            >
+              WORKSPACE: {t.name.toUpperCase()}
+            </span>
+            {t.role === "owner" && (
+              <a
+                href={`/teams/${t.id}/settings`}
+                style={{
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: 9,
+                  color: "var(--text-dim)",
+                  textDecoration: "none",
+                  letterSpacing: "0.08em",
+                }}
+              >
+                SETTINGS →
+              </a>
+            )}
+          </div>
+        ) : null;
+      })()}
 
       <main className="flex flex-col items-center px-4 pt-10 pb-16">
       {/* Header */}
