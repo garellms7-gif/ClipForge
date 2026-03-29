@@ -8,11 +8,19 @@ import threading
 from pathlib import Path
 from typing import Dict, Any
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import uvicorn
+
+# Optional Supabase client (auth + DB persistence)
+try:
+    from supabase import create_client as _supabase_create_client
+    _SUPABASE_AVAILABLE = True
+except ImportError:
+    _SUPABASE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -33,6 +41,86 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Supabase client (JWT verification + DB persistence)
+# ---------------------------------------------------------------------------
+
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+supabase_admin = None
+if _SUPABASE_AVAILABLE and _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        supabase_admin = _supabase_create_client(_SUPABASE_URL, _SUPABASE_SERVICE_ROLE_KEY)
+    except Exception as _exc:
+        import sys as _sys
+        print(f"[ClipForge] WARNING: Could not init Supabase client: {_exc}", file=_sys.stderr)
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+_security = HTTPBearer(auto_error=False)
+
+
+async def get_current_user_id(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_security),
+) -> str:
+    """Verify the Supabase JWT and return the user's UUID."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required. Please sign in.")
+    if supabase_admin is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+        )
+    try:
+        resp = supabase_admin.auth.get_user(credentials.credentials)
+        if resp.user is None:
+            raise ValueError("no user in response")
+        return str(resp.user.id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired authentication token."
+        )
+
+
+def _assert_job_owner(job_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Return the job dict for job_id owned by user_id.
+    Raises 404 (not 403) to avoid leaking other users' job IDs.
+    """
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+    job = jobs[job_id]
+    if job.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+    return job
+
+
+def _db_write(job_id: str, data: Dict[str, Any]) -> None:
+    """Best-effort upsert to the Supabase jobs table. Never raises."""
+    if supabase_admin is None:
+        return
+    try:
+        supabase_admin.table("jobs").upsert({"id": job_id, **data}).execute()
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] DB write failed for job {job_id}: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# In-memory job store
+# ---------------------------------------------------------------------------
 
 # In-memory job store
 jobs: Dict[str, Dict[str, Any]] = {}
@@ -139,7 +227,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # ---------------------------------------------------------------------------
 
 @app.post("/upload")
-async def upload_video(file: UploadFile = File(...)):
+async def upload_video(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
     """Accept a video file, save to temp storage, return job_id."""
     try:
         _check_ffmpeg()
@@ -174,6 +265,7 @@ async def upload_video(file: UploadFile = File(...)):
 
     jobs[job_id] = {
         "status": "pending",
+        "user_id": user_id,
         "input_path": str(input_path),
         "output_path": None,
         "error": None,
@@ -198,19 +290,18 @@ async def upload_video(file: UploadFile = File(...)):
         "pipeline_error": None,
     }
 
+    _db_write(job_id, {"user_id": user_id, "status": "pending", "settings": {}, "summary": None})
     return {"job_id": job_id}
 
 
 @app.post("/process/{job_id}")
-async def process_video(job_id: str, req: ProcessRequest):
+async def process_video(
+    job_id: str,
+    req: ProcessRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """Run dead space removal on the uploaded video."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job["status"] == "processing":
         raise HTTPException(status_code=400, detail="This job is already being processed.")
     if job["status"] == "done":
@@ -246,13 +337,18 @@ async def process_video(job_id: str, req: ProcessRequest):
 
         job["status"] = "done"
         job["output_path"] = str(output_path)
+        _db_write(job_id, {
+            "status": "done",
+            "settings": {"threshold_db": req.threshold_db, "min_silence_duration": req.min_silence_duration},
+        })
         return {"status": "done", "job_id": job_id}
 
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         job["status"] = "error"
         job["error"] = "Processing failed. Try adjusting your settings and running again."
+        _db_write(job_id, {"status": "error"})
         raise HTTPException(
             status_code=500,
             detail="Processing failed. Try adjusting your settings and running again.",
@@ -260,14 +356,12 @@ async def process_video(job_id: str, req: ProcessRequest):
 
 
 @app.get("/status/{job_id}")
-async def get_status(job_id: str):
+async def get_status(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Return current job status: pending | processing | done | error."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     return {
         "job_id": job_id,
         "status": job["status"],
@@ -276,15 +370,12 @@ async def get_status(job_id: str):
 
 
 @app.get("/download/{job_id}")
-async def download_video(job_id: str):
+async def download_video(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Stream the processed file back as an attachment."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
 
     if job["status"] == "processing":
         raise HTTPException(status_code=400, detail="Your video is still being processed. Please wait.")
@@ -458,18 +549,16 @@ def concat_video(
 
 
 @app.post("/process/respawn/{job_id}")
-async def process_respawn(job_id: str, req: RespawnRequest):
+async def process_respawn(
+    job_id: str,
+    req: RespawnRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Detect and remove respawn-wait segments: frames that are black AND silent
     for at least req.min_duration seconds.
     """
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("respawn_status") == "processing":
         raise HTTPException(status_code=400, detail="Respawn processing is already in progress.")
 
@@ -527,15 +616,12 @@ async def process_respawn(job_id: str, req: RespawnRequest):
 
 
 @app.get("/download/respawn/{job_id}")
-async def download_respawn_video(job_id: str):
+async def download_respawn_video(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Stream the respawn-processed file back as an attachment."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     respawn_status = job.get("respawn_status", "idle")
 
     if respawn_status == "processing":
@@ -666,19 +752,17 @@ def find_respawn_segments(
 # ---------------------------------------------------------------------------
 
 @app.post("/process/pipeline/{job_id}")
-async def process_pipeline(job_id: str, req: PipelineRequest):
+async def process_pipeline(
+    job_id: str,
+    req: PipelineRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Run all enabled steps in order: dead space → respawn removal → hype detection.
     Each step uses the output of the previous as its input.
     Processing runs in a background thread; poll GET /status/{job_id}/pipeline.
     """
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("pipeline_status") == "running":
         raise HTTPException(status_code=400, detail="Pipeline is already running.")
 
@@ -714,15 +798,12 @@ async def process_pipeline(job_id: str, req: PipelineRequest):
 
 
 @app.get("/status/{job_id}/pipeline")
-async def get_pipeline_status(job_id: str):
+async def get_pipeline_status(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Return step-by-step progress for a running or completed pipeline."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     status = job.get("pipeline_status", "idle")
     all_steps: list[str] = job.get("pipeline_steps_all", [])
     completed: list[str] = job.get("pipeline_steps_completed", [])
@@ -755,15 +836,12 @@ async def get_pipeline_status(job_id: str):
 
 
 @app.get("/download/pipeline/{job_id}")
-async def download_pipeline_video(job_id: str):
+async def download_pipeline_video(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Stream the pipeline-processed video as an attachment."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("pipeline_status") != "done":
         raise HTTPException(status_code=400, detail="Pipeline has not completed yet.")
 
@@ -790,15 +868,12 @@ async def download_pipeline_video(job_id: str):
 
 
 @app.get("/download/pipeline/{job_id}/hype")
-async def download_pipeline_hype_markers(job_id: str):
+async def download_pipeline_hype_markers(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Return a CapCut-compatible XML file with hype markers from the pipeline run."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("pipeline_status") != "done":
         raise HTTPException(status_code=400, detail="Pipeline has not completed yet.")
 
@@ -822,19 +897,17 @@ async def download_pipeline_hype_markers(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/analyze/hype/{job_id}")
-async def analyze_hype(job_id: str, req: HypeRequest):
+async def analyze_hype(
+    job_id: str,
+    req: HypeRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Detect hype moments: timestamps where audio energy AND motion both spike
     simultaneously. Returns a ranked list of { timestamp, score, label }.
     Does NOT modify the video.
     """
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("hype_status") == "analyzing":
         raise HTTPException(status_code=400, detail="Hype analysis is already in progress.")
 
@@ -878,15 +951,12 @@ async def analyze_hype(job_id: str, req: HypeRequest):
 
 
 @app.get("/analyze/hype/{job_id}/export")
-async def export_hype_markers(job_id: str):
+async def export_hype_markers(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Return a CapCut-compatible XML file with hype moment markers."""
-    if job_id not in jobs:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found. It may have expired — please re-upload your video.",
-        )
-
-    job = jobs[job_id]
+    job = _assert_job_owner(job_id, user_id)
     if job.get("hype_status") != "done":
         raise HTTPException(
             status_code=400,
@@ -1165,20 +1235,23 @@ def _run_pipeline(job_id: str, req: PipelineRequest) -> None:
 
         # ── Finalise ────────────────────────────────────────────────────────
         final_output = current_input if current_input != input_path else None
-        job["pipeline_status"] = "done"
-        job["pipeline_step"] = None
-        job["pipeline_steps_completed"] = list(all_steps)
-        job["pipeline_output_path"] = final_output
-        job["pipeline_summary"] = {
+        summary = {
             "dead_space_removed_seconds": dead_space_removed_seconds,
             "respawn_waits_removed": respawn_waits_removed,
             "hype_moments_found": hype_moments_found,
         }
+        job["pipeline_status"] = "done"
+        job["pipeline_step"] = None
+        job["pipeline_steps_completed"] = list(all_steps)
+        job["pipeline_output_path"] = final_output
+        job["pipeline_summary"] = summary
+        _db_write(job_id, {"status": "done", "summary": summary})
 
     except Exception:
         job["pipeline_status"] = "error"
         job["pipeline_step"] = None
         job["pipeline_error"] = "Pipeline failed. Try adjusting your settings and running again."
+        _db_write(job_id, {"status": "error"})
 
 
 if __name__ == "__main__":

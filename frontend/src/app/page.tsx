@@ -1,9 +1,11 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
+import TopBar from "@/components/TopBar";
 import RespawnPanel, { type RespawnStage, type RespawnStats } from "@/components/RespawnPanel";
 import HypePanel, { type HypeStage, type HypeMoment } from "@/components/HypePanel";
 import PipelinePanel, {
@@ -11,6 +13,7 @@ import PipelinePanel, {
   type PipelineSummary,
 } from "@/components/PipelinePanel";
 import { parseApiError } from "@/lib/api";
+import { supabase } from "@/lib/supabase";
 
 const BASE =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
@@ -35,6 +38,36 @@ const DEFAULT_PIPELINE_RESPAWN_ENABLED = true;
 const DEFAULT_PIPELINE_HYPE_ENABLED = true;
 
 export default function Home() {
+  const router = useRouter();
+
+  // ── Auth state ──
+  const [userEmail, setUserEmail] = useState<string>("");
+  const [isAuthChecked, setIsAuthChecked] = useState(false);
+
+  useEffect(() => {
+    // Check session on mount; redirect to /auth if unauthenticated
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) {
+        router.push("/auth");
+      } else {
+        setUserEmail(session.user.email ?? "");
+        setIsAuthChecked(true);
+      }
+    });
+
+    // Listen for future auth changes (sign-out in another tab, token expiry, etc.)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!session) {
+          router.push("/auth");
+        } else {
+          setUserEmail(session.user.email ?? "");
+        }
+      }
+    );
+    return () => subscription.unsubscribe();
+  }, [router]);
+
   // ── Upload / dead space state ──
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -94,6 +127,37 @@ export default function Home() {
     }
   };
 
+  // Returns headers with Authorization token (and optionally Content-Type: application/json).
+  // Calls getSession() each time so a refreshed token is always used.
+  const getHeaders = async (json = true): Promise<Record<string, string>> => {
+    const { data: { session } } = await supabase.auth.getSession();
+    const h: Record<string, string> = {};
+    if (json) h["Content-Type"] = "application/json";
+    if (session?.access_token) h["Authorization"] = `Bearer ${session.access_token}`;
+    return h;
+  };
+
+  // Download a protected URL as a blob and trigger the browser save dialog.
+  const downloadAuthed = async (url: string, fallbackFilename: string): Promise<void> => {
+    const headers = await getHeaders(false);
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error(await parseApiError(res));
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition");
+    const filename = disposition?.match(/filename="([^"]+)"/)?.[1] ?? fallbackFilename;
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(blobUrl);
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    router.push("/auth");
+  };
+
   // ─────────────────────────────────────────────────────────
   // Dead space handlers
   // ─────────────────────────────────────────────────────────
@@ -127,7 +191,13 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append("file", f);
-      const res = await fetch(`${BASE}/upload`, { method: "POST", body: formData });
+      // No Content-Type — browser sets multipart boundary automatically
+      const uploadHeaders = await getHeaders(false);
+      const res = await fetch(`${BASE}/upload`, {
+        method: "POST",
+        headers: uploadHeaders,
+        body: formData,
+      });
       if (!res.ok) {
         throw new Error(await parseApiError(res));
       }
@@ -153,7 +223,7 @@ export default function Home() {
     try {
       const res = await fetch(`${BASE}/process/${jobId}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await getHeaders(),
         body: JSON.stringify({
           threshold_db: thresholdDb,
           min_silence_duration: minSilenceDuration,
@@ -166,7 +236,8 @@ export default function Home() {
       // Poll every 2 s: processing → done | error
       pollRef.current = setInterval(async () => {
         try {
-          const statusRes = await fetch(`${BASE}/status/${jobId}`);
+          const statusHeaders = await getHeaders(false);
+          const statusRes = await fetch(`${BASE}/status/${jobId}`, { headers: statusHeaders });
           if (!statusRes.ok) return;
           const { status, error } = await statusRes.json();
           if (status === "done") {
@@ -190,9 +261,9 @@ export default function Home() {
     }
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!jobId) return;
-    window.open(`${BASE}/download/${jobId}`, "_blank");
+    await downloadAuthed(`${BASE}/download/${jobId}`, "video_clipped.mp4");
   };
 
   // error → ready (job exists) | idle (upload failed)
@@ -258,7 +329,7 @@ export default function Home() {
     try {
       const res = await fetch(`${BASE}/process/respawn/${jobId}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await getHeaders(),
         body: JSON.stringify({
           black_threshold: blackThreshold,
           min_duration: respawnMinDuration,
@@ -281,9 +352,9 @@ export default function Home() {
     }
   };
 
-  const handleRespawnDownload = () => {
+  const handleRespawnDownload = async () => {
     if (!jobId) return;
-    window.open(`${BASE}/download/respawn/${jobId}`, "_blank");
+    await downloadAuthed(`${BASE}/download/respawn/${jobId}`, "video_respawn_removed.mp4");
   };
 
   const handleRespawnRetry = () => {
@@ -305,7 +376,7 @@ export default function Home() {
     try {
       const res = await fetch(`${BASE}/analyze/hype/${jobId}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await getHeaders(),
         body: JSON.stringify({
           audio_sensitivity: audioSensitivity,
           motion_sensitivity: motionSensitivity,
@@ -329,17 +400,7 @@ export default function Home() {
   const handleHypeExport = async () => {
     if (!jobId) return;
     try {
-      const res = await fetch(`${BASE}/analyze/hype/${jobId}/export`);
-      if (!res.ok) {
-        throw new Error(await parseApiError(res));
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "hype_markers.xml";
-      a.click();
-      URL.revokeObjectURL(url);
+      await downloadAuthed(`${BASE}/analyze/hype/${jobId}/export`, "hype_markers.xml");
     } catch {
       // silent — export failure doesn't change stage
     }
@@ -369,7 +430,7 @@ export default function Home() {
     try {
       const res = await fetch(`${BASE}/process/pipeline/${jobId}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await getHeaders(),
         body: JSON.stringify({
           dead_space: {
             enabled: pipelineDeadSpaceEnabled,
@@ -394,7 +455,10 @@ export default function Home() {
       // Poll pipeline status every 2s
       pipelinePollRef.current = setInterval(async () => {
         try {
-          const statusRes = await fetch(`${BASE}/status/${jobId}/pipeline`);
+          const pipelineStatusHeaders = await getHeaders(false);
+          const statusRes = await fetch(`${BASE}/status/${jobId}/pipeline`, {
+            headers: pipelineStatusHeaders,
+          });
           if (!statusRes.ok) return;
           const data = await statusRes.json();
           setPipelineCurrentStep(data.current_step ?? null);
@@ -425,23 +489,15 @@ export default function Home() {
     }
   };
 
-  const handlePipelineDownload = () => {
+  const handlePipelineDownload = async () => {
     if (!jobId) return;
-    window.open(`${BASE}/download/pipeline/${jobId}`, "_blank");
+    await downloadAuthed(`${BASE}/download/pipeline/${jobId}`, "video_pipeline.mp4");
   };
 
   const handlePipelineExportHype = async () => {
     if (!jobId) return;
     try {
-      const res = await fetch(`${BASE}/download/pipeline/${jobId}/hype`);
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "hype_markers.xml";
-      a.click();
-      URL.revokeObjectURL(url);
+      await downloadAuthed(`${BASE}/download/pipeline/${jobId}/hype`, "hype_markers.xml");
     } catch {
       // silent — export failure is non-critical
     }
@@ -470,11 +526,14 @@ export default function Home() {
   // Render
   // ─────────────────────────────────────────────────────────
 
+  // Don't render until auth is confirmed — prevents flash of unauthenticated UI
+  if (!isAuthChecked) return null;
+
   return (
-    <main
-      className="min-h-screen flex flex-col items-center px-4 py-16"
-      style={{ background: "var(--bg)" }}
-    >
+    <div style={{ background: "var(--bg)", minHeight: "100vh" }}>
+      <TopBar userEmail={userEmail} onSignOut={handleSignOut} />
+
+      <main className="flex flex-col items-center px-4 pt-10 pb-16">
       {/* Header */}
       <header className="mb-12 text-center">
         <div className="flex items-center justify-center gap-3 mb-3">
@@ -707,6 +766,7 @@ export default function Home() {
       >
         ClipForge &mdash; built for creators
       </footer>
-    </main>
+      </main>
+    </div>
   );
 }
