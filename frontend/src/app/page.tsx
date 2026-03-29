@@ -207,7 +207,16 @@ export default function Home() {
     return h;
   };
 
-  // Download a protected URL as a blob and trigger the browser save dialog.
+  // Download a protected endpoint that returns { download_url } — opens the signed URL in a new tab.
+  const downloadSigned = async (url: string): Promise<void> => {
+    const headers = await getHeaders(false);
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error(await parseApiError(res));
+    const { download_url } = await res.json();
+    window.open(download_url, "_blank");
+  };
+
+  // Download a streaming endpoint (XML exports) as a blob and trigger the save dialog.
   const downloadAuthed = async (url: string, fallbackFilename: string): Promise<void> => {
     const headers = await getHeaders(false);
     const res = await fetch(url, { headers });
@@ -401,7 +410,7 @@ export default function Home() {
 
   const handleDownload = async () => {
     if (!jobId) return;
-    await downloadAuthed(`${BASE}/download/${jobId}`, "video_clipped.mp4");
+    await downloadSigned(`${BASE}/download/${jobId}`);
   };
 
   // error → ready (job exists) | idle (upload failed)
@@ -497,7 +506,7 @@ export default function Home() {
 
   const handleRespawnDownload = async () => {
     if (!jobId) return;
-    await downloadAuthed(`${BASE}/download/respawn/${jobId}`, "video_respawn_removed.mp4");
+    await downloadSigned(`${BASE}/download/respawn/${jobId}`);
   };
 
   const handleRespawnRetry = () => {
@@ -634,7 +643,7 @@ export default function Home() {
 
   const handlePipelineDownload = async () => {
     if (!jobId) return;
-    await downloadAuthed(`${BASE}/download/pipeline/${jobId}`, "video_pipeline.mp4");
+    await downloadSigned(`${BASE}/download/pipeline/${jobId}`);
   };
 
   const handlePipelineExportHype = async () => {

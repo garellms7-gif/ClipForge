@@ -230,6 +230,54 @@ def _increment_video_count(user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Supabase Storage helpers
+# ---------------------------------------------------------------------------
+
+UPLOAD_BUCKET = "clipforge-uploads"
+OUTPUT_BUCKET = "clipforge-outputs"
+
+
+def _storage_upload(bucket: str, storage_path: str, local_path: str | Path) -> None:
+    """Upload a local file to a Supabase Storage bucket. Raises on failure."""
+    if supabase_admin is None:
+        raise RuntimeError(
+            "Supabase Storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+        )
+    with open(local_path, "rb") as fh:
+        supabase_admin.storage.from_(bucket).upload(
+            path=storage_path,
+            file=fh,
+            file_options={"content-type": "video/mp4", "upsert": "true"},
+        )
+
+
+def _storage_download(bucket: str, storage_path: str, local_path: str | Path) -> None:
+    """Download a file from a Supabase Storage bucket to a local path."""
+    if supabase_admin is None:
+        raise RuntimeError(
+            "Supabase Storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+        )
+    data: bytes = supabase_admin.storage.from_(bucket).download(storage_path)
+    with open(local_path, "wb") as fh:
+        fh.write(data)
+
+
+def _storage_signed_url(bucket: str, storage_path: str, expires: int = 3600) -> str:
+    """Create a time-limited signed URL for a private Supabase Storage file."""
+    if supabase_admin is None:
+        raise RuntimeError(
+            "Supabase Storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+        )
+    res = supabase_admin.storage.from_(bucket).create_signed_url(
+        path=storage_path, expires_in=expires
+    )
+    # supabase-py 2.x may return a model or a dict
+    if isinstance(res, dict):
+        return res.get("signedURL") or res.get("signed_url") or ""
+    return getattr(res, "signed_url", None) or getattr(res, "signedURL", "") or str(res)
+
+
+# ---------------------------------------------------------------------------
 # In-memory job store
 # ---------------------------------------------------------------------------
 
@@ -403,16 +451,33 @@ async def upload_video(
             detail=f"Failed to save uploaded file: {exc}",
         )
 
+    # Upload to Supabase Storage, then remove the local temp file
+    storage_input_path = f"{user_id}/{job_id}/original{suffix}"
+    try:
+        _storage_upload(UPLOAD_BUCKET, storage_input_path, input_path)
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store uploaded file: {exc}",
+        )
+    try:
+        input_path.unlink(missing_ok=True)
+        job_dir.rmdir()
+    except Exception:
+        pass
+
     jobs[job_id] = {
         "status": "pending",
         "user_id": user_id,
-        "input_path": str(input_path),
-        "output_path": None,
+        "storage_input_path": storage_input_path,
+        "storage_output_path": None,
+        "storage_respawn_output_path": None,
+        "storage_pipeline_output_path": None,
         "error": None,
         "filename": file.filename,
         # respawn fields (populated by /process/respawn/{job_id})
         "respawn_status": "idle",
-        "respawn_output_path": None,
         "respawn_stats": None,
         "respawn_error": None,
         # hype fields (populated by /analyze/hype/{job_id})
@@ -424,7 +489,6 @@ async def upload_video(
         "pipeline_step": None,
         "pipeline_steps_all": [],
         "pipeline_steps_completed": [],
-        "pipeline_output_path": None,
         "pipeline_hype_moments": None,
         "pipeline_summary": None,
         "pipeline_error": None,
@@ -460,8 +524,26 @@ async def process_video(
 
     job["status"] = "processing"
     job["error"] = None
-    input_path = job["input_path"]
-    job_dir = Path(input_path).parent
+
+    storage_input = job.get("storage_input_path") or ""
+    if not storage_input:
+        job["status"] = "error"
+        job["error"] = "Source file not found in storage."
+        raise HTTPException(status_code=500, detail="Source file not found in storage.")
+
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_input = job_dir / "input.mp4"
+
+    try:
+        _storage_download(UPLOAD_BUCKET, storage_input, local_input)
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job["status"] = "error"
+        job["error"] = "Could not retrieve source file from storage."
+        raise HTTPException(status_code=500, detail=f"Failed to download source: {exc}")
+
+    input_path = str(local_input)
     output_path = job_dir / f"{job_id}_processed.mp4"
 
     try:
@@ -476,8 +558,12 @@ async def process_video(
 
         concat_video(input_path, keep_intervals, str(output_path))
 
+        storage_output = f"{user_id}/{job_id}/processed.mp4"
+        _storage_upload(OUTPUT_BUCKET, storage_output, output_path)
+        shutil.rmtree(job_dir, ignore_errors=True)
+
         job["status"] = "done"
-        job["output_path"] = str(output_path)
+        job["storage_output_path"] = storage_output
         _db_write(job_id, {
             "status": "done",
             "settings": {"threshold_db": req.threshold_db, "min_silence_duration": req.min_silence_duration},
@@ -487,6 +573,7 @@ async def process_video(
     except HTTPException:
         raise
     except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
         job["status"] = "error"
         job["error"] = "Processing failed. Try adjusting your settings and running again."
         _db_write(job_id, {"status": "error"})
@@ -515,7 +602,7 @@ async def download_video(
     job_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Stream the processed file back as an attachment."""
+    """Return a short-lived signed URL for the processed video."""
     job = _assert_job_owner(job_id, user_id)
 
     if job["status"] == "processing":
@@ -525,22 +612,19 @@ async def download_video(
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail=f"Job is not ready for download (status: {job['status']}).")
 
-    output_path = job["output_path"]
-    if not output_path or not Path(output_path).exists():
+    storage_output = job.get("storage_output_path")
+    if not storage_output:
         raise HTTPException(
             status_code=404,
-            detail="Processed file not found on disk. It may have been cleaned up — please process again.",
+            detail="Processed file not found in storage. It may have been cleaned up — please process again.",
         )
 
-    original_name = Path(job.get("filename", "output.mp4")).stem
-    download_name = f"{original_name}_clipped.mp4"
+    try:
+        signed_url = _storage_signed_url(OUTPUT_BUCKET, storage_output, expires=3600)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate download link: {exc}")
 
-    return FileResponse(
-        path=output_path,
-        media_type="video/mp4",
-        filename=download_name,
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-    )
+    return {"download_url": signed_url}
 
 
 # ---------------------------------------------------------------------------
@@ -712,23 +796,35 @@ async def process_respawn(
     job["respawn_status"] = "processing"
     job["respawn_error"] = None
 
-    input_path = job["input_path"]
-    job_dir = Path(input_path).parent
+    storage_input = job.get("storage_input_path") or ""
+    if not storage_input:
+        job["respawn_status"] = "error"
+        job["respawn_error"] = "Source file not found in storage."
+        raise HTTPException(status_code=500, detail="Source file not found in storage.")
+
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_input = job_dir / "respawn_input.mp4"
+
+    try:
+        _storage_download(UPLOAD_BUCKET, storage_input, local_input)
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job["respawn_status"] = "error"
+        job["respawn_error"] = "Could not retrieve source file from storage."
+        raise HTTPException(status_code=500, detail=f"Failed to download source: {exc}")
+
+    input_path = str(local_input)
     output_path = job_dir / f"{job_id}_respawn_processed.mp4"
 
     try:
-        # Detect black-frame segments
         black_segs = detect_black_frames(input_path, req.black_threshold, job_dir)
-
-        # Detect silence with a lenient threshold so short dips register
         silence_segs = detect_silence(input_path, -35.0, 0.3)
-
-        # Find segments where BOTH conditions overlap >= min_duration
         respawn_segs = find_respawn_segments(black_segs, silence_segs, req.min_duration)
 
         if not respawn_segs:
+            shutil.rmtree(job_dir, ignore_errors=True)
             job["respawn_status"] = "done"
-            job["respawn_output_path"] = None
             job["respawn_stats"] = {"segments_removed": 0, "time_saved_seconds": 0.0}
             return {"status": "done", "segments_removed": 0, "time_saved_seconds": 0.0}
 
@@ -736,11 +832,15 @@ async def process_respawn(
         keep_intervals = invert_silence_segments(respawn_segs, duration)
         concat_video(input_path, keep_intervals, str(output_path))
 
+        storage_respawn = f"{user_id}/{job_id}/respawn.mp4"
+        _storage_upload(OUTPUT_BUCKET, storage_respawn, output_path)
+        shutil.rmtree(job_dir, ignore_errors=True)
+
         time_saved = round(sum(e - s for s, e in respawn_segs), 1)
         stats = {"segments_removed": len(respawn_segs), "time_saved_seconds": time_saved}
 
         job["respawn_status"] = "done"
-        job["respawn_output_path"] = str(output_path)
+        job["storage_respawn_output_path"] = storage_respawn
         job["respawn_stats"] = stats
 
         return {"status": "done", **stats}
@@ -748,6 +848,7 @@ async def process_respawn(
     except HTTPException:
         raise
     except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
         job["respawn_status"] = "error"
         job["respawn_error"] = "Processing failed. Try adjusting your settings and running again."
         raise HTTPException(
@@ -761,7 +862,7 @@ async def download_respawn_video(
     job_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Stream the respawn-processed file back as an attachment."""
+    """Return a short-lived signed URL for the respawn-processed video."""
     job = _assert_job_owner(job_id, user_id)
     respawn_status = job.get("respawn_status", "idle")
 
@@ -772,24 +873,16 @@ async def download_respawn_video(
     if respawn_status != "done":
         raise HTTPException(status_code=400, detail="Respawn processing has not been run yet.")
 
-    output_path = job.get("respawn_output_path")
-    if not output_path:
+    storage_respawn = job.get("storage_respawn_output_path")
+    if not storage_respawn:
         raise HTTPException(status_code=400, detail="No respawn waits were detected — nothing to download.")
-    if not Path(output_path).exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Processed file not found on disk. It may have been cleaned up — please process again.",
-        )
 
-    original_name = Path(job.get("filename", "output.mp4")).stem
-    download_name = f"{original_name}_respawn_removed.mp4"
+    try:
+        signed_url = _storage_signed_url(OUTPUT_BUCKET, storage_respawn, expires=3600)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate download link: {exc}")
 
-    return FileResponse(
-        path=output_path,
-        media_type="video/mp4",
-        filename=download_name,
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-    )
+    return {"download_url": signed_url}
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +1062,7 @@ async def get_pipeline_status(
 
     if status == "done":
         resp["summary"] = job.get("pipeline_summary")
-        resp["has_video_output"] = job.get("pipeline_output_path") is not None
+        resp["has_video_output"] = job.get("storage_pipeline_output_path") is not None
     elif status == "error":
         resp["error"] = job.get("pipeline_error", "Pipeline failed. Please try again.")
 
@@ -981,31 +1074,24 @@ async def download_pipeline_video(
     job_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Stream the pipeline-processed video as an attachment."""
+    """Return a short-lived signed URL for the pipeline-processed video."""
     job = _assert_job_owner(job_id, user_id)
     if job.get("pipeline_status") != "done":
         raise HTTPException(status_code=400, detail="Pipeline has not completed yet.")
 
-    output_path = job.get("pipeline_output_path")
-    if not output_path:
+    storage_pipeline = job.get("storage_pipeline_output_path")
+    if not storage_pipeline:
         raise HTTPException(
             status_code=400,
             detail="No video output from pipeline — only analysis steps were run.",
         )
-    if not Path(output_path).exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Processed file not found on disk. It may have been cleaned up — please process again.",
-        )
 
-    original_name = Path(job.get("filename", "output.mp4")).stem
-    download_name = f"{original_name}_pipeline.mp4"
-    return FileResponse(
-        path=output_path,
-        media_type="video/mp4",
-        filename=download_name,
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-    )
+    try:
+        signed_url = _storage_signed_url(OUTPUT_BUCKET, storage_pipeline, expires=3600)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate download link: {exc}")
+
+    return {"download_url": signed_url}
 
 
 @app.get("/download/pipeline/{job_id}/hype")
@@ -1062,11 +1148,27 @@ async def analyze_hype(
     job["hype_status"] = "analyzing"
     job["hype_error"] = None
 
-    input_path = job["input_path"]
-    job_dir = Path(input_path).parent
+    storage_input = job.get("storage_input_path") or ""
+    if not storage_input:
+        job["hype_status"] = "error"
+        job["hype_error"] = "Source file not found in storage."
+        raise HTTPException(status_code=500, detail="Source file not found in storage.")
+
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_input = job_dir / "hype_input.mp4"
 
     try:
-        # Extract a mono 22050 Hz WAV for librosa
+        _storage_download(UPLOAD_BUCKET, storage_input, local_input)
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job["hype_status"] = "error"
+        job["hype_error"] = "Could not retrieve source file from storage."
+        raise HTTPException(status_code=500, detail=f"Failed to download source: {exc}")
+
+    input_path = str(local_input)
+
+    try:
         audio_path = job_dir / "audio.wav"
         _extract_audio_wav(input_path, str(audio_path))
 
@@ -1075,6 +1177,8 @@ async def analyze_hype(
 
         moments = _merge_hype_moments(audio_peaks, motion_peaks, req.min_gap_seconds)
 
+        shutil.rmtree(job_dir, ignore_errors=True)
+
         job["hype_status"] = "done"
         job["hype_moments"] = moments
 
@@ -1082,7 +1186,8 @@ async def analyze_hype(
 
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
         job["hype_status"] = "error"
         job["hype_error"] = "Analysis failed. Try adjusting your settings and running again."
         raise HTTPException(
@@ -1504,17 +1609,29 @@ async def publish_to_youtube(
 
     job = _assert_job_owner(job_id, user_id)
 
-    # Determine which file to upload: prefer most-processed output
-    video_path = (
-        job.get("pipeline_output_path")
-        or job.get("output_path")
-        or job.get("respawn_output_path")
+    # Pick the most-processed output available (pipeline > dead space > respawn)
+    storage_video_path = (
+        job.get("storage_pipeline_output_path")
+        or job.get("storage_output_path")
+        or job.get("storage_respawn_output_path")
     )
-    if not video_path or not Path(video_path).exists():
+    if not storage_video_path:
         raise HTTPException(
             status_code=400,
             detail="No processed video found. Please process your video before publishing.",
         )
+
+    # Download from Supabase Storage to a local temp file for the YouTube upload
+    yt_job_dir = TEMP_DIR / f"{job_id}_yt"
+    yt_job_dir.mkdir(parents=True, exist_ok=True)
+    local_video = yt_job_dir / "upload.mp4"
+    try:
+        _storage_download(OUTPUT_BUCKET, storage_video_path, local_video)
+    except Exception as exc:
+        shutil.rmtree(yt_job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve video for publishing: {exc}")
+
+    video_path = str(local_video)
 
     # Load credentials
     creds = _load_youtube_creds(user_id)
@@ -1561,6 +1678,7 @@ async def publish_to_youtube(
         # Persist potentially-refreshed credentials
         _save_youtube_creds(user_id, creds)
 
+        shutil.rmtree(yt_job_dir, ignore_errors=True)
         video_id = response["id"]
         return {
             "video_id": video_id,
@@ -1568,8 +1686,10 @@ async def publish_to_youtube(
         }
 
     except HTTPException:
+        shutil.rmtree(yt_job_dir, ignore_errors=True)
         raise
     except Exception as exc:
+        shutil.rmtree(yt_job_dir, ignore_errors=True)
         import sys
         print(f"[ClipForge] YouTube upload failed for job {job_id}: {exc}", file=sys.stderr)
         raise HTTPException(
@@ -1727,10 +1847,30 @@ def _run_pipeline(job_id: str, req: PipelineRequest) -> None:
     Updates job dict fields directly (thread-safe for CPython dict writes).
     """
     job = jobs[job_id]
-    input_path: str = job["input_path"]
-    job_dir = Path(input_path).parent
     all_steps: list[str] = job["pipeline_steps_all"]
 
+    # Download source from Supabase Storage to a local temp directory
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_input = job_dir / "pipeline_input.mp4"
+
+    storage_input = job.get("storage_input_path") or ""
+    if not storage_input:
+        job["pipeline_status"] = "error"
+        job["pipeline_error"] = "Source file not found in storage."
+        _db_write(job_id, {"status": "error"})
+        return
+
+    try:
+        _storage_download(UPLOAD_BUCKET, storage_input, local_input)
+    except Exception as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job["pipeline_status"] = "error"
+        job["pipeline_error"] = "Could not retrieve source file from storage."
+        _db_write(job_id, {"status": "error"})
+        return
+
+    input_path = str(local_input)
     current_input = input_path
     dead_space_removed_seconds = 0.0
     respawn_waits_removed = 0
@@ -1806,20 +1946,29 @@ def _run_pipeline(job_id: str, req: PipelineRequest) -> None:
             job["pipeline_steps_completed"] = list(all_steps)
 
         # ── Finalise ────────────────────────────────────────────────────────
-        final_output = current_input if current_input != input_path else None
+        has_video_output = current_input != input_path
         summary = {
             "dead_space_removed_seconds": dead_space_removed_seconds,
             "respawn_waits_removed": respawn_waits_removed,
             "hype_moments_found": hype_moments_found,
         }
+
+        storage_pipeline: str | None = None
+        if has_video_output:
+            storage_pipeline = f"{job['user_id']}/{job_id}/pipeline.mp4"
+            _storage_upload(OUTPUT_BUCKET, storage_pipeline, current_input)
+
+        shutil.rmtree(job_dir, ignore_errors=True)
+
         job["pipeline_status"] = "done"
         job["pipeline_step"] = None
         job["pipeline_steps_completed"] = list(all_steps)
-        job["pipeline_output_path"] = final_output
+        job["storage_pipeline_output_path"] = storage_pipeline
         job["pipeline_summary"] = summary
         _db_write(job_id, {"status": "done", "summary": summary})
 
     except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
         job["pipeline_status"] = "error"
         job["pipeline_step"] = None
         job["pipeline_error"] = "Pipeline failed. Try adjusting your settings and running again."
