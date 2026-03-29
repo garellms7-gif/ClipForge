@@ -4,6 +4,7 @@ import uuid
 import json
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, Any
 
@@ -54,6 +55,31 @@ class HypeRequest(BaseModel):
     audio_sensitivity: float = 0.7   # 0.1–1.0 RMS energy threshold (normalised)
     motion_sensitivity: float = 0.6  # 0.1–1.0 frame-diff threshold (normalised)
     min_gap_seconds: float = 3.0     # merge events closer than this
+
+
+class DeadSpaceSettings(BaseModel):
+    enabled: bool = True
+    threshold_db: float = -35.0
+    min_silence_duration: float = 0.5
+
+
+class RespawnSettings(BaseModel):
+    enabled: bool = True
+    black_threshold: float = 0.1
+    min_duration: float = 1.5
+
+
+class HypeSettings(BaseModel):
+    enabled: bool = True
+    audio_sensitivity: float = 0.7
+    motion_sensitivity: float = 0.6
+    min_gap_seconds: float = 3.0
+
+
+class PipelineRequest(BaseModel):
+    dead_space: DeadSpaceSettings = DeadSpaceSettings()
+    respawn_removal: RespawnSettings = RespawnSettings()
+    hype_detection: HypeSettings = HypeSettings()
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +187,15 @@ async def upload_video(file: UploadFile = File(...)):
         "hype_status": "idle",
         "hype_moments": None,
         "hype_error": None,
+        # pipeline fields (populated by /process/pipeline/{job_id})
+        "pipeline_status": "idle",   # idle | running | done | error
+        "pipeline_step": None,
+        "pipeline_steps_all": [],
+        "pipeline_steps_completed": [],
+        "pipeline_output_path": None,
+        "pipeline_hype_moments": None,
+        "pipeline_summary": None,
+        "pipeline_error": None,
     }
 
     return {"job_id": job_id}
@@ -627,6 +662,162 @@ def find_respawn_segments(
 
 
 # ---------------------------------------------------------------------------
+# Full Pipeline endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/process/pipeline/{job_id}")
+async def process_pipeline(job_id: str, req: PipelineRequest):
+    """
+    Run all enabled steps in order: dead space → respawn removal → hype detection.
+    Each step uses the output of the previous as its input.
+    Processing runs in a background thread; poll GET /status/{job_id}/pipeline.
+    """
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("pipeline_status") == "running":
+        raise HTTPException(status_code=400, detail="Pipeline is already running.")
+
+    if not any([req.dead_space.enabled, req.respawn_removal.enabled, req.hype_detection.enabled]):
+        raise HTTPException(status_code=400, detail="At least one pipeline step must be enabled.")
+
+    try:
+        _check_ffmpeg()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    all_steps: list[str] = []
+    if req.dead_space.enabled:
+        all_steps.append("dead_space")
+    if req.respawn_removal.enabled:
+        all_steps.append("respawn_removal")
+    if req.hype_detection.enabled:
+        all_steps.append("hype_detection")
+
+    job["pipeline_status"] = "running"
+    job["pipeline_step"] = all_steps[0] if all_steps else None
+    job["pipeline_steps_all"] = list(all_steps)
+    job["pipeline_steps_completed"] = []
+    job["pipeline_output_path"] = None
+    job["pipeline_hype_moments"] = None
+    job["pipeline_summary"] = None
+    job["pipeline_error"] = None
+
+    t = threading.Thread(target=_run_pipeline, args=(job_id, req), daemon=True)
+    t.start()
+
+    return {"status": "running", "job_id": job_id}
+
+
+@app.get("/status/{job_id}/pipeline")
+async def get_pipeline_status(job_id: str):
+    """Return step-by-step progress for a running or completed pipeline."""
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    status = job.get("pipeline_status", "idle")
+    all_steps: list[str] = job.get("pipeline_steps_all", [])
+    completed: list[str] = job.get("pipeline_steps_completed", [])
+    current_step = job.get("pipeline_step")
+    remaining = [s for s in all_steps if s not in completed and s != current_step]
+
+    n = len(all_steps)
+    if status == "done":
+        percent = 100
+    elif n > 0:
+        percent = round(len(completed) / n * 100)
+    else:
+        percent = 0
+
+    resp: dict[str, Any] = {
+        "status": status,
+        "current_step": current_step,
+        "steps_completed": completed,
+        "steps_remaining": remaining,
+        "percent": percent,
+    }
+
+    if status == "done":
+        resp["summary"] = job.get("pipeline_summary")
+        resp["has_video_output"] = job.get("pipeline_output_path") is not None
+    elif status == "error":
+        resp["error"] = job.get("pipeline_error", "Pipeline failed. Please try again.")
+
+    return resp
+
+
+@app.get("/download/pipeline/{job_id}")
+async def download_pipeline_video(job_id: str):
+    """Stream the pipeline-processed video as an attachment."""
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("pipeline_status") != "done":
+        raise HTTPException(status_code=400, detail="Pipeline has not completed yet.")
+
+    output_path = job.get("pipeline_output_path")
+    if not output_path:
+        raise HTTPException(
+            status_code=400,
+            detail="No video output from pipeline — only analysis steps were run.",
+        )
+    if not Path(output_path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Processed file not found on disk. It may have been cleaned up — please process again.",
+        )
+
+    original_name = Path(job.get("filename", "output.mp4")).stem
+    download_name = f"{original_name}_pipeline.mp4"
+    return FileResponse(
+        path=output_path,
+        media_type="video/mp4",
+        filename=download_name,
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+@app.get("/download/pipeline/{job_id}/hype")
+async def download_pipeline_hype_markers(job_id: str):
+    """Return a CapCut-compatible XML file with hype markers from the pipeline run."""
+    if job_id not in jobs:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found. It may have expired — please re-upload your video.",
+        )
+
+    job = jobs[job_id]
+    if job.get("pipeline_status") != "done":
+        raise HTTPException(status_code=400, detail="Pipeline has not completed yet.")
+
+    moments = job.get("pipeline_hype_moments") or []
+    if not moments:
+        raise HTTPException(
+            status_code=400,
+            detail="No hype moments were detected in the pipeline run — nothing to export.",
+        )
+
+    xml_content = _build_capcut_xml(moments)
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={"Content-Disposition": 'attachment; filename="hype_markers.xml"'},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hype Moment Detection endpoints
 # ---------------------------------------------------------------------------
 
@@ -881,6 +1072,113 @@ def _build_capcut_xml(moments: list[dict]) -> str:
         )
     lines += ["  </markers>", "</sequence>"]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runner (executes in a daemon thread)
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(job_id: str, req: PipelineRequest) -> None:
+    """
+    Run dead-space removal → respawn removal → hype detection in sequence.
+    Each video-processing step uses the output of the previous step as input.
+    Updates job dict fields directly (thread-safe for CPython dict writes).
+    """
+    job = jobs[job_id]
+    input_path: str = job["input_path"]
+    job_dir = Path(input_path).parent
+    all_steps: list[str] = job["pipeline_steps_all"]
+
+    current_input = input_path
+    dead_space_removed_seconds = 0.0
+    respawn_waits_removed = 0
+    hype_moments_found = 0
+
+    try:
+        # ── Step 1: Dead Space Removal ──────────────────────────────────────
+        if req.dead_space.enabled:
+            job["pipeline_step"] = "dead_space"
+
+            silence_segs = detect_silence(
+                current_input,
+                req.dead_space.threshold_db,
+                req.dead_space.min_silence_duration,
+            )
+            duration = get_video_duration(current_input)
+            keep_intervals = invert_silence_segments(silence_segs, duration)
+
+            if keep_intervals:
+                out = str(job_dir / f"{job_id}_pipeline_deadspace.mp4")
+                concat_video(current_input, keep_intervals, out)
+                kept = sum(e - s for s, e in keep_intervals)
+                dead_space_removed_seconds = round(max(0.0, duration - kept), 1)
+                current_input = out
+
+            job["pipeline_steps_completed"] = [
+                s for s in all_steps
+                if s == "dead_space" or s in job["pipeline_steps_completed"]
+            ]
+
+        # ── Step 2: Respawn Wait Removal ────────────────────────────────────
+        if req.respawn_removal.enabled:
+            job["pipeline_step"] = "respawn_removal"
+
+            black_segs = detect_black_frames(
+                current_input, req.respawn_removal.black_threshold, job_dir
+            )
+            silence_segs = detect_silence(current_input, -35.0, 0.3)
+            respawn_segs = find_respawn_segments(
+                black_segs, silence_segs, req.respawn_removal.min_duration
+            )
+
+            if respawn_segs:
+                duration = get_video_duration(current_input)
+                keep_intervals = invert_silence_segments(respawn_segs, duration)
+                out = str(job_dir / f"{job_id}_pipeline_respawn.mp4")
+                concat_video(current_input, keep_intervals, out)
+                respawn_waits_removed = len(respawn_segs)
+                current_input = out
+
+            job["pipeline_steps_completed"] = [
+                s for s in all_steps
+                if s in ("dead_space", "respawn_removal")
+                or s in job["pipeline_steps_completed"]
+            ]
+
+        # ── Step 3: Hype Detection ───────────────────────────────────────────
+        if req.hype_detection.enabled:
+            job["pipeline_step"] = "hype_detection"
+
+            audio_path = str(job_dir / "pipeline_audio.wav")
+            _extract_audio_wav(current_input, audio_path)
+            audio_peaks = _audio_rms_peaks(audio_path, req.hype_detection.audio_sensitivity)
+            motion_peaks = _motion_diff_peaks(
+                current_input, req.hype_detection.motion_sensitivity, job_dir
+            )
+            moments = _merge_hype_moments(
+                audio_peaks, motion_peaks, req.hype_detection.min_gap_seconds
+            )
+            hype_moments_found = len(moments)
+            job["pipeline_hype_moments"] = moments
+
+            job["pipeline_steps_completed"] = list(all_steps)
+
+        # ── Finalise ────────────────────────────────────────────────────────
+        final_output = current_input if current_input != input_path else None
+        job["pipeline_status"] = "done"
+        job["pipeline_step"] = None
+        job["pipeline_steps_completed"] = list(all_steps)
+        job["pipeline_output_path"] = final_output
+        job["pipeline_summary"] = {
+            "dead_space_removed_seconds": dead_space_removed_seconds,
+            "respawn_waits_removed": respawn_waits_removed,
+            "hype_moments_found": hype_moments_found,
+        }
+
+    except Exception:
+        job["pipeline_status"] = "error"
+        job["pipeline_step"] = None
+        job["pipeline_error"] = "Pipeline failed. Try adjusting your settings and running again."
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@ import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
 import RespawnPanel, { type RespawnStage, type RespawnStats } from "@/components/RespawnPanel";
 import HypePanel, { type HypeStage, type HypeMoment } from "@/components/HypePanel";
+import PipelinePanel, {
+  type PipelineStage,
+  type PipelineSummary,
+} from "@/components/PipelinePanel";
 import { parseApiError } from "@/lib/api";
 
 const BASE =
@@ -26,6 +30,9 @@ const DEFAULT_RESPAWN_MIN_DURATION = 1.5;
 const DEFAULT_AUDIO_SENSITIVITY = 0.7;
 const DEFAULT_MOTION_SENSITIVITY = 0.6;
 const DEFAULT_MIN_GAP = 3.0;
+const DEFAULT_PIPELINE_DEAD_SPACE_ENABLED = true;
+const DEFAULT_PIPELINE_RESPAWN_ENABLED = true;
+const DEFAULT_PIPELINE_HYPE_ENABLED = true;
 
 export default function Home() {
   // ── Upload / dead space state ──
@@ -46,6 +53,20 @@ export default function Home() {
   const [respawnStats, setRespawnStats] = useState<RespawnStats | null>(null);
   const [respawnErrorMsg, setRespawnErrorMsg] = useState<string>("");
 
+  // ── Pipeline state ──
+  const [pipelineMode, setPipelineMode] = useState(false);
+  const [pipelineDeadSpaceEnabled, setPipelineDeadSpaceEnabled] = useState(DEFAULT_PIPELINE_DEAD_SPACE_ENABLED);
+  const [pipelineRespawnEnabled, setPipelineRespawnEnabled] = useState(DEFAULT_PIPELINE_RESPAWN_ENABLED);
+  const [pipelineHypeEnabled, setPipelineHypeEnabled] = useState(DEFAULT_PIPELINE_HYPE_ENABLED);
+  const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
+  const [pipelineCurrentStep, setPipelineCurrentStep] = useState<string | null>(null);
+  const [pipelineStepsCompleted, setPipelineStepsCompleted] = useState<string[]>([]);
+  const [pipelinePercent, setPipelinePercent] = useState(0);
+  const [pipelineSummary, setPipelineSummary] = useState<PipelineSummary | null>(null);
+  const [pipelineErrorMsg, setPipelineErrorMsg] = useState<string>("");
+  const [pipelineHasVideoOutput, setPipelineHasVideoOutput] = useState(false);
+  const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // ── Hype state ──
   const [hypeEnabled, setHypeEnabled] = useState(false);
   const [audioSensitivity, setAudioSensitivity] = useState<number>(DEFAULT_AUDIO_SENSITIVITY);
@@ -63,6 +84,13 @@ export default function Home() {
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
+    }
+  };
+
+  const stopPipelinePolling = () => {
+    if (pipelinePollRef.current) {
+      clearInterval(pipelinePollRef.current);
+      pipelinePollRef.current = null;
     }
   };
 
@@ -86,6 +114,15 @@ export default function Home() {
     setHypeStage("idle");
     setHypeMoments([]);
     setHypeErrorMsg("");
+    // reset pipeline state for the new file
+    stopPipelinePolling();
+    setPipelineStage("idle");
+    setPipelineCurrentStep(null);
+    setPipelineStepsCompleted([]);
+    setPipelinePercent(0);
+    setPipelineSummary(null);
+    setPipelineHasVideoOutput(false);
+    setPipelineErrorMsg("");
 
     try {
       const formData = new FormData();
@@ -193,6 +230,19 @@ export default function Home() {
     setAudioSensitivity(DEFAULT_AUDIO_SENSITIVITY);
     setMotionSensitivity(DEFAULT_MOTION_SENSITIVITY);
     setMinGapSeconds(DEFAULT_MIN_GAP);
+    // reset pipeline too
+    stopPipelinePolling();
+    setPipelineMode(false);
+    setPipelineDeadSpaceEnabled(DEFAULT_PIPELINE_DEAD_SPACE_ENABLED);
+    setPipelineRespawnEnabled(DEFAULT_PIPELINE_RESPAWN_ENABLED);
+    setPipelineHypeEnabled(DEFAULT_PIPELINE_HYPE_ENABLED);
+    setPipelineStage("idle");
+    setPipelineCurrentStep(null);
+    setPipelineStepsCompleted([]);
+    setPipelinePercent(0);
+    setPipelineSummary(null);
+    setPipelineHasVideoOutput(false);
+    setPipelineErrorMsg("");
   };
 
   // ─────────────────────────────────────────────────────────
@@ -302,6 +352,113 @@ export default function Home() {
   };
 
   // ─────────────────────────────────────────────────────────
+  // Pipeline handlers
+  // ─────────────────────────────────────────────────────────
+
+  const handlePipelineRun = async () => {
+    if (!jobId) return;
+    stopPipelinePolling();
+    setPipelineStage("running");
+    setPipelineErrorMsg("");
+    setPipelineCurrentStep(null);
+    setPipelineStepsCompleted([]);
+    setPipelinePercent(0);
+    setPipelineSummary(null);
+    setPipelineHasVideoOutput(false);
+
+    try {
+      const res = await fetch(`${BASE}/process/pipeline/${jobId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dead_space: {
+            enabled: pipelineDeadSpaceEnabled,
+            threshold_db: thresholdDb,
+            min_silence_duration: minSilenceDuration,
+          },
+          respawn_removal: {
+            enabled: pipelineRespawnEnabled,
+            black_threshold: blackThreshold,
+            min_duration: respawnMinDuration,
+          },
+          hype_detection: {
+            enabled: pipelineHypeEnabled,
+            audio_sensitivity: audioSensitivity,
+            motion_sensitivity: motionSensitivity,
+            min_gap_seconds: minGapSeconds,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(await parseApiError(res));
+
+      // Poll pipeline status every 2s
+      pipelinePollRef.current = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${BASE}/status/${jobId}/pipeline`);
+          if (!statusRes.ok) return;
+          const data = await statusRes.json();
+          setPipelineCurrentStep(data.current_step ?? null);
+          setPipelineStepsCompleted(data.steps_completed ?? []);
+          setPipelinePercent(data.percent ?? 0);
+          if (data.status === "done") {
+            stopPipelinePolling();
+            setPipelineStage("done");
+            setPipelineSummary(data.summary ?? null);
+            setPipelineHasVideoOutput(data.has_video_output ?? false);
+          } else if (data.status === "error") {
+            stopPipelinePolling();
+            setPipelineStage("error");
+            setPipelineErrorMsg(
+              data.error ?? "Pipeline failed. Try adjusting your settings and running again."
+            );
+          }
+        } catch {
+          // network hiccup — keep polling
+        }
+      }, 2000);
+    } catch (e: unknown) {
+      stopPipelinePolling();
+      setPipelineStage("error");
+      setPipelineErrorMsg(
+        e instanceof Error ? e.message : "Something went wrong. Please try again."
+      );
+    }
+  };
+
+  const handlePipelineDownload = () => {
+    if (!jobId) return;
+    window.open(`${BASE}/download/pipeline/${jobId}`, "_blank");
+  };
+
+  const handlePipelineExportHype = async () => {
+    if (!jobId) return;
+    try {
+      const res = await fetch(`${BASE}/download/pipeline/${jobId}/hype`);
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "hype_markers.xml";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // silent — export failure is non-critical
+    }
+  };
+
+  const handlePipelineRetry = () => {
+    stopPipelinePolling();
+    setPipelineStage("idle");
+    setPipelineCurrentStep(null);
+    setPipelineStepsCompleted([]);
+    setPipelinePercent(0);
+    setPipelineSummary(null);
+    setPipelineHasVideoOutput(false);
+    setPipelineErrorMsg("");
+  };
+
+  // ─────────────────────────────────────────────────────────
   // Derived
   // ─────────────────────────────────────────────────────────
 
@@ -358,6 +515,51 @@ export default function Home() {
 
         {showPanels && (
           <>
+            {/* ── Full Pipeline card (always visible when panels are shown) ── */}
+            <PipelinePanel
+              pipelineMode={pipelineMode}
+              onPipelineModeChange={(v) => {
+                setPipelineMode(v);
+                if (!v) stopPipelinePolling();
+              }}
+              deadSpaceEnabled={pipelineDeadSpaceEnabled}
+              onDeadSpaceEnabledChange={setPipelineDeadSpaceEnabled}
+              respawnEnabled={pipelineRespawnEnabled}
+              onRespawnEnabledChange={setPipelineRespawnEnabled}
+              hypeEnabled={pipelineHypeEnabled}
+              onHypeEnabledChange={setPipelineHypeEnabled}
+              thresholdDb={thresholdDb}
+              onThresholdDbChange={setThresholdDb}
+              minSilenceDuration={minSilenceDuration}
+              onMinSilenceDurationChange={setMinSilenceDuration}
+              blackThreshold={blackThreshold}
+              onBlackThresholdChange={setBlackThreshold}
+              respawnMinDuration={respawnMinDuration}
+              onRespawnMinDurationChange={setRespawnMinDuration}
+              audioSensitivity={audioSensitivity}
+              onAudioSensitivityChange={setAudioSensitivity}
+              motionSensitivity={motionSensitivity}
+              onMotionSensitivityChange={setMotionSensitivity}
+              minGapSeconds={minGapSeconds}
+              onMinGapSecondsChange={setMinGapSeconds}
+              stage={pipelineStage}
+              currentStep={pipelineCurrentStep}
+              stepsCompleted={pipelineStepsCompleted}
+              percent={pipelinePercent}
+              summary={pipelineSummary}
+              errorMsg={pipelineErrorMsg}
+              hasVideoOutput={pipelineHasVideoOutput}
+              onRun={handlePipelineRun}
+              onDownload={handlePipelineDownload}
+              onExportHype={handlePipelineExportHype}
+              onRetry={handlePipelineRetry}
+              hasJob={jobId !== null}
+              disabled={isWorking}
+            />
+
+            {/* ── Individual feature panels (hidden when pipeline mode is on) ── */}
+            {!pipelineMode && (
+              <>
             {/* ── Dead Space Removal card ── */}
             <SettingsPanel
               thresholdDb={thresholdDb}
@@ -493,6 +695,8 @@ export default function Home() {
               hasJob={jobId !== null}
               disabled={isWorking || hypeStage === "analyzing"}
             />
+              </>
+            )}
           </>
         )}
       </div>
