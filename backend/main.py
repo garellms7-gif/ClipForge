@@ -2,15 +2,18 @@ import os
 import shutil
 import uuid
 import json
+import time
+import secrets
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import uvicorn
@@ -21,6 +24,17 @@ try:
     _SUPABASE_AVAILABLE = True
 except ImportError:
     _SUPABASE_AVAILABLE = False
+
+# Optional Google API client (YouTube publishing)
+try:
+    from google_auth_oauthlib.flow import Flow as _GoogleAuthFlow
+    from google.oauth2.credentials import Credentials as _GoogleCredentials
+    from google.auth.transport.requests import Request as _GoogleAuthRequest
+    from googleapiclient.discovery import build as _google_build
+    from googleapiclient.http import MediaFileUpload as _MediaFileUpload
+    _GOOGLE_APIS_AVAILABLE = True
+except ImportError:
+    _GOOGLE_APIS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -56,6 +70,22 @@ if _SUPABASE_AVAILABLE and _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY:
     except Exception as _exc:
         import sys as _sys
         print(f"[ClipForge] WARNING: Could not init Supabase client: {_exc}", file=_sys.stderr)
+
+# ---------------------------------------------------------------------------
+# Google OAuth / YouTube configuration
+# ---------------------------------------------------------------------------
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/youtube/callback"
+)
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+
+YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+# Short-lived nonces: state_token → (user_id, expiry_epoch). Keyed by random URL-safe string.
+_youtube_oauth_states: Dict[str, tuple[str, float]] = {}
 
 # ---------------------------------------------------------------------------
 # Auth dependency
@@ -145,6 +175,14 @@ class HypeRequest(BaseModel):
     min_gap_seconds: float = 3.0     # merge events closer than this
 
 
+class YouTubePublishRequest(BaseModel):
+    title: str
+    description: str = ""
+    tags: list[str] = []
+    privacy: Literal["public", "unlisted", "private"] = "private"
+    category_id: str = "20"  # 20 = Gaming
+
+
 class DeadSpaceSettings(BaseModel):
     enabled: bool = True
     threshold_db: float = -35.0
@@ -200,10 +238,19 @@ def _check_librosa() -> None:
         raise RuntimeError("librosa is not installed on the server. Contact support.")
 
 
+def _check_google() -> None:
+    """Raise RuntimeError if Google API libraries are not installed."""
+    if not _GOOGLE_APIS_AVAILABLE:
+        raise RuntimeError(
+            "Google API libraries are not installed. "
+            "Run: pip install google-auth google-auth-oauthlib google-api-python-client"
+        )
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     import sys
-    for check in (_check_ffmpeg, _check_cv2, _check_librosa):
+    for check in (_check_ffmpeg, _check_cv2, _check_librosa, _check_google):
         try:
             check()
         except RuntimeError as exc:
@@ -1142,6 +1189,299 @@ def _build_capcut_xml(moments: list[dict]) -> str:
         )
     lines += ["  </markers>", "</sequence>"]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# YouTube publishing helpers
+# ---------------------------------------------------------------------------
+
+def _get_youtube_flow() -> "_GoogleAuthFlow":
+    """Build a google-auth-oauthlib Flow for the YouTube upload scope."""
+    if not _GOOGLE_APIS_AVAILABLE:
+        raise RuntimeError("Google API libraries are not installed.")
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise RuntimeError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set.")
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI],
+        }
+    }
+    return _GoogleAuthFlow.from_client_config(
+        client_config,
+        scopes=YOUTUBE_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI,
+    )
+
+
+def _creds_to_dict(creds: "_GoogleCredentials") -> dict:
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes) if creds.scopes else YOUTUBE_SCOPES,
+    }
+
+
+def _creds_from_dict(d: dict) -> "_GoogleCredentials":
+    return _GoogleCredentials(
+        token=d.get("token"),
+        refresh_token=d.get("refresh_token"),
+        token_uri=d.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=d.get("client_id"),
+        client_secret=d.get("client_secret"),
+        scopes=d.get("scopes", YOUTUBE_SCOPES),
+    )
+
+
+def _save_youtube_creds(user_id: str, creds: "_GoogleCredentials") -> None:
+    """Persist Google credentials to user_profiles table. Best-effort."""
+    if supabase_admin is None:
+        return
+    try:
+        supabase_admin.table("user_profiles").upsert({
+            "user_id": user_id,
+            "youtube_credentials": _creds_to_dict(creds),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] Failed to save YouTube creds for {user_id}: {exc}", file=sys.stderr)
+
+
+def _load_youtube_creds(user_id: str) -> "_GoogleCredentials | None":
+    """Load and optionally refresh Google credentials from user_profiles."""
+    if supabase_admin is None or not _GOOGLE_APIS_AVAILABLE:
+        return None
+    try:
+        result = (
+            supabase_admin.table("user_profiles")
+            .select("youtube_credentials")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not result.data or not result.data[0].get("youtube_credentials"):
+            return None
+        creds = _creds_from_dict(result.data[0]["youtube_credentials"])
+        # Refresh if expired
+        if creds.expired and creds.refresh_token:
+            creds.refresh(_GoogleAuthRequest())
+            _save_youtube_creds(user_id, creds)
+        return creds
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] Failed to load YouTube creds for {user_id}: {exc}", file=sys.stderr)
+        return None
+
+
+def _cleanup_oauth_states() -> None:
+    """Remove OAuth state nonces older than 10 minutes."""
+    cutoff = time.time()
+    expired = [k for k, (_, exp) in _youtube_oauth_states.items() if exp < cutoff]
+    for k in expired:
+        del _youtube_oauth_states[k]
+
+
+async def _verify_token_from_query(token: str) -> str:
+    """Validate a raw Supabase JWT string and return the user_id. Raises HTTP 401 on failure."""
+    if supabase_admin is None:
+        raise HTTPException(status_code=503, detail="Authentication service is not configured.")
+    try:
+        resp = supabase_admin.auth.get_user(token)
+        if resp.user is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        return str(resp.user.id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+
+# ---------------------------------------------------------------------------
+# YouTube publishing endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/youtube")
+async def youtube_auth(token: str = Query(..., description="Supabase JWT from the frontend")):
+    """
+    Redirect the authenticated user to the Google OAuth consent screen.
+    The frontend navigates window.location.href to this URL, passing the
+    Supabase JWT as ?token= because browser navigation cannot carry headers.
+    """
+    try:
+        _check_google()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    user_id = await _verify_token_from_query(token)
+
+    _cleanup_oauth_states()
+
+    # Generate a short-lived state nonce (valid for 10 minutes)
+    state = secrets.token_urlsafe(32)
+    _youtube_oauth_states[state] = (user_id, time.time() + 600)
+
+    flow = _get_youtube_flow()
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        state=state,
+        prompt="consent",  # always ask so we receive a refresh_token
+    )
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/auth/youtube/callback")
+async def youtube_callback(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+):
+    """
+    Google redirects here after the user grants (or denies) YouTube access.
+    Exchanges the authorization code for tokens, persists them, and redirects
+    back to the frontend.
+    """
+    _cleanup_oauth_states()
+
+    if error or not code or not state:
+        return RedirectResponse(url=f"{FRONTEND_URL}/?youtube=error")
+
+    entry = _youtube_oauth_states.pop(state, None)
+    if entry is None:
+        return RedirectResponse(url=f"{FRONTEND_URL}/?youtube=error")
+
+    user_id, expiry = entry
+    if time.time() > expiry:
+        return RedirectResponse(url=f"{FRONTEND_URL}/?youtube=error")
+
+    try:
+        flow = _get_youtube_flow()
+        # Allow HTTP for local development (must set OAUTHLIB_INSECURE_TRANSPORT=1 in env)
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        _save_youtube_creds(user_id, creds)
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] YouTube OAuth callback failed: {exc}", file=sys.stderr)
+        return RedirectResponse(url=f"{FRONTEND_URL}/?youtube=error")
+
+    return RedirectResponse(url=f"{FRONTEND_URL}/?youtube=connected")
+
+
+@app.get("/auth/youtube/status")
+async def youtube_status(user_id: str = Depends(get_current_user_id)):
+    """Return whether the authenticated user has YouTube credentials stored."""
+    if supabase_admin is None:
+        return {"connected": False}
+    try:
+        result = (
+            supabase_admin.table("user_profiles")
+            .select("youtube_credentials")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        connected = bool(result.data and result.data[0].get("youtube_credentials"))
+        return {"connected": connected}
+    except Exception:
+        return {"connected": False}
+
+
+@app.post("/publish/youtube/{job_id}")
+async def publish_to_youtube(
+    job_id: str,
+    req: YouTubePublishRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Upload the processed video file to YouTube using the stored OAuth credentials.
+    Uses resumable upload (1 MB chunks) so large files are handled gracefully.
+    Returns the YouTube video URL and video ID.
+    """
+    try:
+        _check_google()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    job = _assert_job_owner(job_id, user_id)
+
+    # Determine which file to upload: prefer most-processed output
+    video_path = (
+        job.get("pipeline_output_path")
+        or job.get("output_path")
+        or job.get("respawn_output_path")
+    )
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(
+            status_code=400,
+            detail="No processed video found. Please process your video before publishing.",
+        )
+
+    # Load credentials
+    creds = _load_youtube_creds(user_id)
+    if creds is None:
+        raise HTTPException(
+            status_code=400,
+            detail="YouTube is not connected. Please connect your YouTube account first.",
+        )
+    if creds.expired and not creds.refresh_token:
+        raise HTTPException(
+            status_code=400,
+            detail="YouTube credentials have expired and cannot be refreshed. Please reconnect.",
+        )
+
+    try:
+        youtube = _google_build("youtube", "v3", credentials=creds)
+
+        body = {
+            "snippet": {
+                "title": req.title[:100],  # YouTube title limit
+                "description": req.description[:5000],
+                "tags": req.tags[:500],
+                "categoryId": req.category_id,
+            },
+            "status": {
+                "privacyStatus": req.privacy,
+            },
+        }
+
+        insert_request = youtube.videos().insert(
+            part=",".join(body.keys()),
+            body=body,
+            media_body=_MediaFileUpload(
+                video_path,
+                chunksize=1024 * 1024,  # 1 MB chunks
+                resumable=True,
+            ),
+        )
+
+        response = None
+        while response is None:
+            _, response = insert_request.next_chunk()
+
+        # Persist potentially-refreshed credentials
+        _save_youtube_creds(user_id, creds)
+
+        video_id = response["id"]
+        return {
+            "video_id": video_id,
+            "youtube_url": f"https://www.youtube.com/watch?v={video_id}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] YouTube upload failed for job {job_id}: {exc}", file=sys.stderr)
+        raise HTTPException(
+            status_code=500,
+            detail="YouTube upload failed. Please try again or check your YouTube channel settings.",
+        )
 
 
 # ---------------------------------------------------------------------------

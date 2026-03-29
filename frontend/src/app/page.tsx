@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
 import StatusBar from "@/components/StatusBar";
@@ -12,6 +12,7 @@ import PipelinePanel, {
   type PipelineStage,
   type PipelineSummary,
 } from "@/components/PipelinePanel";
+import YouTubePanel, { type YouTubePublishStage } from "@/components/YouTubePanel";
 import { parseApiError } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 
@@ -39,6 +40,7 @@ const DEFAULT_PIPELINE_HYPE_ENABLED = true;
 
 export default function Home() {
   const router = useRouter();
+  const searchParams = useSearchParams();
 
   // ── Auth state ──
   const [userEmail, setUserEmail] = useState<string>("");
@@ -68,8 +70,50 @@ export default function Home() {
     return () => subscription.unsubscribe();
   }, [router]);
 
+  // Handle ?youtube=connected param — both in popup and in main window
+  useEffect(() => {
+    const param = searchParams.get("youtube");
+    if (param === "connected") {
+      if (window.opener) {
+        // We're in the popup — notify the parent and close
+        window.opener.postMessage("youtube_connected", window.location.origin);
+        window.close();
+      } else {
+        // Fallback: main window redirect (no popup)
+        setYoutubeConnected(true);
+        setYoutubeConnectionChecked(true);
+        // Strip the query param so it doesn't persist on refresh
+        router.replace("/");
+      }
+    }
+  }, [searchParams, router]);
+
+  // Listen for postMessage from OAuth popup
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data === "youtube_connected") {
+        setYoutubeConnected(true);
+        setYoutubeConnectionChecked(true);
+        youtubePopupRef.current?.close();
+        youtubePopupRef.current = null;
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  // Check YouTube connection once when a processed video is available
+  useEffect(() => {
+    if ((stage === "done" || pipelineStage === "done") && !youtubeConnectionChecked) {
+      checkYoutubeConnection();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, pipelineStage]);
+
   // ── Upload / dead space state ──
   const [file, setFile] = useState<File | null>(null);
+
   const [jobId, setJobId] = useState<string | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
   const [isUploading, setIsUploading] = useState(false);
@@ -99,6 +143,14 @@ export default function Home() {
   const [pipelineErrorMsg, setPipelineErrorMsg] = useState<string>("");
   const [pipelineHasVideoOutput, setPipelineHasVideoOutput] = useState(false);
   const pipelinePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── YouTube state ──
+  const [youtubeConnected, setYoutubeConnected] = useState(false);
+  const [youtubeConnectionChecked, setYoutubeConnectionChecked] = useState(false);
+  const [youtubePublishStage, setYoutubePublishStage] = useState<YouTubePublishStage>("idle");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeErrorMsg, setYoutubeErrorMsg] = useState("");
+  const youtubePopupRef = useRef<Window | null>(null);
 
   // ── Hype state ──
   const [hypeEnabled, setHypeEnabled] = useState(false);
@@ -159,6 +211,67 @@ export default function Home() {
   };
 
   // ─────────────────────────────────────────────────────────
+  // YouTube helpers
+  // ─────────────────────────────────────────────────────────
+
+  const checkYoutubeConnection = async () => {
+    try {
+      const res = await fetch(`${BASE}/auth/youtube/status`, {
+        headers: await getHeaders(false),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setYoutubeConnected(data.connected === true);
+      }
+    } catch {
+      // non-fatal
+    } finally {
+      setYoutubeConnectionChecked(true);
+    }
+  };
+
+  const handleConnectYouTube = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session?.access_token) return;
+    const url = `${BASE}/auth/youtube?token=${encodeURIComponent(session.access_token)}`;
+    const popup = window.open(url, "youtube_oauth", "width=600,height=700");
+    youtubePopupRef.current = popup;
+  };
+
+  const handlePublishYouTube = async (params: {
+    title: string;
+    description: string;
+    tags: string[];
+    privacy: "private" | "unlisted" | "public";
+  }) => {
+    if (!jobId) return;
+    setYoutubePublishStage("publishing");
+    setYoutubeErrorMsg("");
+    try {
+      const res = await fetch(`${BASE}/publish/youtube/${jobId}`, {
+        method: "POST",
+        headers: await getHeaders(),
+        body: JSON.stringify(params),
+      });
+      if (!res.ok) throw new Error(await parseApiError(res));
+      const data = await res.json();
+      setYoutubeUrl(data.youtube_url);
+      setYoutubePublishStage("published");
+    } catch (e: unknown) {
+      setYoutubePublishStage("error");
+      setYoutubeErrorMsg(
+        e instanceof Error ? e.message : "Publish failed. Please try again."
+      );
+    }
+  };
+
+  const handleYoutubeRetry = () => {
+    setYoutubePublishStage("idle");
+    setYoutubeErrorMsg("");
+    setYoutubeUrl("");
+  };
+
+  // ─────────────────────────────────────────────────────────
   // Dead space handlers
   // ─────────────────────────────────────────────────────────
 
@@ -187,6 +300,11 @@ export default function Home() {
     setPipelineSummary(null);
     setPipelineHasVideoOutput(false);
     setPipelineErrorMsg("");
+    // reset YouTube publish state for new file (keep connection status)
+    setYoutubePublishStage("idle");
+    setYoutubeUrl("");
+    setYoutubeErrorMsg("");
+    setYoutubeConnectionChecked(false);
 
     try {
       const formData = new FormData();
@@ -314,6 +432,11 @@ export default function Home() {
     setPipelineSummary(null);
     setPipelineHasVideoOutput(false);
     setPipelineErrorMsg("");
+    // reset YouTube too
+    setYoutubePublishStage("idle");
+    setYoutubeUrl("");
+    setYoutubeErrorMsg("");
+    setYoutubeConnectionChecked(false);
   };
 
   // ─────────────────────────────────────────────────────────
@@ -519,6 +642,8 @@ export default function Home() {
   // ─────────────────────────────────────────────────────────
 
   const isWorking = isUploading || stage === "processing";
+  const hasProcessedVideo =
+    stage === "done" || pipelineStage === "done";
   const showPanels =
     stage === "ready" || stage === "processing" || stage === "done" || stage === "error";
 
@@ -757,6 +882,22 @@ export default function Home() {
               </>
             )}
           </>
+        )}
+
+        {/* ── YouTube Publish card (shown once any processing is complete) ── */}
+        {hasProcessedVideo && (
+          <YouTubePanel
+            connected={youtubeConnected}
+            connectionChecked={youtubeConnectionChecked}
+            stage={youtubePublishStage}
+            youtubeUrl={youtubeUrl}
+            errorMsg={youtubeErrorMsg}
+            defaultTitle={file?.name.replace(/\.[^.]+$/, "") ?? "My ClipForge Video"}
+            onConnect={handleConnectYouTube}
+            onPublish={handlePublishYouTube}
+            onRetry={handleYoutubeRetry}
+            disabled={isWorking}
+          />
         )}
       </div>
 
