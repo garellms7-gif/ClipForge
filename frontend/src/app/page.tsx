@@ -46,6 +46,11 @@ export default function Home() {
   const [userEmail, setUserEmail] = useState<string>("");
   const [isAuthChecked, setIsAuthChecked] = useState(false);
 
+  // ── Billing state ──
+  const [billingPlan, setBillingPlan] = useState<string>("free");
+  const [billingVideosUsed, setBillingVideosUsed] = useState<number>(0);
+  const [billingLimit, setBillingLimit] = useState<number | null>(3);
+
   useEffect(() => {
     // Check session on mount; redirect to /auth if unauthenticated
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -54,6 +59,19 @@ export default function Home() {
       } else {
         setUserEmail(session.user.email ?? "");
         setIsAuthChecked(true);
+        // Fetch billing status in the background
+        fetch(`${BASE}/billing/status`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        })
+          .then((r) => r.ok ? r.json() : null)
+          .then((data) => {
+            if (data) {
+              setBillingPlan(data.plan ?? "free");
+              setBillingVideosUsed(data.videos_this_month ?? 0);
+              setBillingLimit(data.limit ?? null);
+            }
+          })
+          .catch(() => undefined);
       }
     });
 
@@ -322,6 +340,8 @@ export default function Home() {
       const { job_id } = await res.json();
       setJobId(job_id);
       setStage("ready");
+      // Optimistically update the usage banner counter
+      setBillingVideosUsed((prev) => prev + 1);
     } catch (e: unknown) {
       setStage("error");
       setErrorMsg(
@@ -657,6 +677,47 @@ export default function Home() {
   return (
     <div style={{ background: "var(--bg)", minHeight: "100vh" }}>
       <TopBar userEmail={userEmail} onSignOut={handleSignOut} />
+
+      {/* Usage banner — shown only on Free plan */}
+      {billingPlan === "free" && billingLimit !== null && (
+        <div
+          style={{
+            background: billingVideosUsed >= billingLimit ? "var(--red-dim)" : "var(--surface)",
+            borderBottom: `1px solid ${billingVideosUsed >= billingLimit ? "var(--red-border)" : "var(--border)"}`,
+            padding: "9px 20px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 12,
+          }}
+        >
+          <span
+            style={{
+              fontFamily: "'DM Sans', sans-serif",
+              fontSize: 13,
+              color: billingVideosUsed >= billingLimit ? "var(--red)" : "var(--text-muted)",
+            }}
+          >
+            {billingVideosUsed} of {billingLimit} free video{billingLimit !== 1 ? "s" : ""} used this month
+            {billingVideosUsed >= billingLimit ? " — limit reached" : ""}
+          </span>
+          <a
+            href="/billing"
+            style={{
+              fontFamily: "'Space Mono', monospace",
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: "0.1em",
+              color: "var(--green)",
+              textDecoration: "none",
+              padding: "3px 8px",
+              border: "1px solid var(--green-border)",
+            }}
+          >
+            UPGRADE TO CREATOR →
+          </a>
+        </div>
+      )}
 
       <main className="flex flex-col items-center px-4 pt-10 pb-16">
       {/* Header */}

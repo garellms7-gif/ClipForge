@@ -36,6 +36,13 @@ try:
 except ImportError:
     _GOOGLE_APIS_AVAILABLE = False
 
+# Optional Stripe client (subscription billing)
+try:
+    import stripe as _stripe
+    _STRIPE_AVAILABLE = True
+except ImportError:
+    _STRIPE_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
@@ -86,6 +93,18 @@ YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 # Short-lived nonces: state_token → (user_id, expiry_epoch). Keyed by random URL-safe string.
 _youtube_oauth_states: Dict[str, tuple[str, float]] = {}
+
+# ---------------------------------------------------------------------------
+# Stripe / billing configuration
+# ---------------------------------------------------------------------------
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_CREATOR = os.environ.get("STRIPE_PRICE_CREATOR", "")
+STRIPE_PRICE_TEAM = os.environ.get("STRIPE_PRICE_TEAM", "")
+
+FREE_VIDEO_LIMIT = 3
+PLAN_LIMITS: Dict[str, int | None] = {"free": FREE_VIDEO_LIMIT, "creator": None, "team": None}
 
 # ---------------------------------------------------------------------------
 # Auth dependency
@@ -149,6 +168,68 @@ def _db_write(job_id: str, data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Billing helpers
+# ---------------------------------------------------------------------------
+
+def _get_user_profile(user_id: str) -> Dict[str, Any]:
+    """Fetch user_profiles row; returns empty dict on failure."""
+    if supabase_admin is None:
+        return {}
+    try:
+        resp = (
+            supabase_admin.table("user_profiles")
+            .select("*")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        return resp.data or {}
+    except Exception:
+        return {}
+
+
+def _get_usage(user_id: str) -> tuple[str, int]:
+    """Return (plan, videos_this_month), auto-resetting the counter on a new month."""
+    profile = _get_user_profile(user_id)
+    plan: str = profile.get("plan", "free") or "free"
+    videos_this_month: int = profile.get("videos_this_month", 0) or 0
+    usage_month: str = profile.get("usage_month", "") or ""
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    if usage_month != current_month and supabase_admin:
+        try:
+            supabase_admin.table("user_profiles").upsert({
+                "user_id": user_id,
+                "videos_this_month": 0,
+                "usage_month": current_month,
+            }).execute()
+        except Exception:
+            pass
+        videos_this_month = 0
+    return plan, videos_this_month
+
+
+def _increment_video_count(user_id: str) -> None:
+    """Increment videos_this_month for the user. Best-effort, never raises."""
+    if supabase_admin is None:
+        return
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    try:
+        profile = _get_user_profile(user_id)
+        count = profile.get("videos_this_month", 0) or 0
+        stored_month = profile.get("usage_month", "") or ""
+        if stored_month != current_month:
+            count = 0
+        supabase_admin.table("user_profiles").upsert({
+            "user_id": user_id,
+            "videos_this_month": count + 1,
+            "usage_month": current_month,
+        }).execute()
+    except Exception as exc:
+        import sys
+        print(f"[ClipForge] Failed to increment video count: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # In-memory job store
 # ---------------------------------------------------------------------------
 
@@ -181,6 +262,10 @@ class YouTubePublishRequest(BaseModel):
     tags: list[str] = []
     privacy: Literal["public", "unlisted", "private"] = "private"
     category_id: str = "20"  # 20 = Gaming
+
+
+class CheckoutRequest(BaseModel):
+    plan: Literal["creator", "team"]
 
 
 class DeadSpaceSettings(BaseModel):
@@ -287,6 +372,14 @@ async def upload_video(
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
+    # Plan enforcement: Free plan is limited to 3 videos/month
+    _plan, _videos_used = _get_usage(user_id)
+    if _plan == "free" and _videos_used >= FREE_VIDEO_LIMIT:
+        raise HTTPException(
+            status_code=403,
+            detail="Monthly limit reached. Upgrade to Creator for unlimited videos.",
+        )
+
     job_id = str(uuid.uuid4())
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -338,6 +431,7 @@ async def upload_video(
     }
 
     _db_write(job_id, {"user_id": user_id, "status": "pending", "settings": {}, "summary": None})
+    _increment_video_count(user_id)
     return {"job_id": job_id}
 
 
@@ -1482,6 +1576,144 @@ async def publish_to_youtube(
             status_code=500,
             detail="YouTube upload failed. Please try again or check your YouTube channel settings.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Billing routes
+# ---------------------------------------------------------------------------
+
+@app.post("/billing/checkout")
+async def billing_checkout(
+    req: CheckoutRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Create a Stripe Checkout session for the selected plan."""
+    if not _STRIPE_AVAILABLE or not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing is not configured.")
+    price_id = STRIPE_PRICE_CREATOR if req.plan == "creator" else STRIPE_PRICE_TEAM
+    if not price_id:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Price ID for the '{req.plan}' plan is not configured.",
+        )
+    try:
+        _stripe.api_key = STRIPE_SECRET_KEY
+        session = _stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{FRONTEND_URL}/billing/success",
+            cancel_url=f"{FRONTEND_URL}/billing",
+            metadata={"user_id": user_id},
+        )
+        return {"checkout_url": session.url}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create checkout session: {exc}",
+        )
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request):
+    """Handle Stripe webhook events to keep subscription state in sync."""
+    if not _STRIPE_AVAILABLE or not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Billing webhook is not configured.")
+    _stripe.api_key = STRIPE_SECRET_KEY
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    try:
+        event = _stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except _stripe.error.SignatureVerificationError:  # type: ignore[attr-defined]
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Webhook error: {exc}")
+
+    event_type = event["type"]
+
+    if event_type == "checkout.session.completed":
+        session_obj = event["data"]["object"]
+        uid = (session_obj.get("metadata") or {}).get("user_id")
+        if uid and supabase_admin:
+            # Resolve the price ID to determine the plan name
+            price_id = None
+            try:
+                line_items = _stripe.checkout.Session.list_line_items(session_obj["id"], limit=1)
+                if line_items.data:
+                    price_id = line_items.data[0].price.id
+            except Exception:
+                pass
+            if price_id == STRIPE_PRICE_CREATOR:
+                plan_name = "creator"
+            elif price_id == STRIPE_PRICE_TEAM:
+                plan_name = "team"
+            else:
+                plan_name = "creator"  # safe default for unrecognised price
+            try:
+                supabase_admin.table("user_profiles").upsert({
+                    "user_id": uid,
+                    "plan": plan_name,
+                    "stripe_customer_id": session_obj.get("customer") or "",
+                    "stripe_subscription_id": session_obj.get("subscription") or "",
+                }).execute()
+            except Exception as exc:
+                import sys
+                print(f"[ClipForge] Webhook DB update failed: {exc}", file=sys.stderr)
+
+    elif event_type == "customer.subscription.deleted":
+        sub_obj = event["data"]["object"]
+        customer_id = sub_obj.get("customer")
+        if customer_id and supabase_admin:
+            try:
+                resp = (
+                    supabase_admin.table("user_profiles")
+                    .select("user_id")
+                    .eq("stripe_customer_id", customer_id)
+                    .maybe_single()
+                    .execute()
+                )
+                if resp.data:
+                    supabase_admin.table("user_profiles").upsert({
+                        "user_id": resp.data["user_id"],
+                        "plan": "free",
+                        "stripe_subscription_id": "",
+                    }).execute()
+            except Exception as exc:
+                import sys
+                print(f"[ClipForge] Webhook subscription-deleted handling error: {exc}", file=sys.stderr)
+
+    elif event_type == "invoice.payment_failed":
+        invoice_obj = event["data"]["object"]
+        customer_id = invoice_obj.get("customer")
+        if customer_id and supabase_admin:
+            try:
+                resp = (
+                    supabase_admin.table("user_profiles")
+                    .select("user_id")
+                    .eq("stripe_customer_id", customer_id)
+                    .maybe_single()
+                    .execute()
+                )
+                if resp.data:
+                    supabase_admin.table("user_profiles").upsert({
+                        "user_id": resp.data["user_id"],
+                        "plan": "free",
+                    }).execute()
+            except Exception as exc:
+                import sys
+                print(f"[ClipForge] Webhook payment-failed handling error: {exc}", file=sys.stderr)
+
+    return {"received": True}
+
+
+@app.get("/billing/status")
+async def billing_status(user_id: str = Depends(get_current_user_id)):
+    """Return the authenticated user's current plan and monthly usage."""
+    plan, videos_this_month = _get_usage(user_id)
+    return {
+        "plan": plan,
+        "videos_this_month": videos_this_month,
+        "limit": PLAN_LIMITS.get(plan),
+    }
 
 
 # ---------------------------------------------------------------------------
