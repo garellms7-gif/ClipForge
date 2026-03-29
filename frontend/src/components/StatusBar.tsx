@@ -8,7 +8,7 @@ interface StatusBarProps {
 }
 
 export default function StatusBar({ stage, errorMsg }: StatusBarProps) {
-  if (stage === "idle" || stage === "uploading" || stage === "ready") return null;
+  if (stage === "idle" || stage === "ready") return null;
 
   if (stage === "error") {
     return (

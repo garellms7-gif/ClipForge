@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import DropZone from "@/components/DropZone";
 import SettingsPanel from "@/components/SettingsPanel";
@@ -38,9 +38,35 @@ const DEFAULT_PIPELINE_DEAD_SPACE_ENABLED = true;
 const DEFAULT_PIPELINE_RESPAWN_ENABLED = true;
 const DEFAULT_PIPELINE_HYPE_ENABLED = true;
 
-export default function Home() {
+// ---------------------------------------------------------------------------
+// SearchParamsHandler — isolated so it can be wrapped in <Suspense>.
+// Next.js 14 requires any component calling useSearchParams() to be inside
+// a Suspense boundary; hoisting it to a leaf component satisfies that rule.
+// ---------------------------------------------------------------------------
+function SearchParamsHandler({
+  onYouTubeConnected,
+}: {
+  onYouTubeConnected: () => void;
+}) {
   const router = useRouter();
   const searchParams = useSearchParams();
+  useEffect(() => {
+    const param = searchParams.get("youtube");
+    if (param === "connected") {
+      if (window.opener) {
+        window.opener.postMessage("youtube_connected", window.location.origin);
+        window.close();
+      } else {
+        onYouTubeConnected();
+        router.replace("/");
+      }
+    }
+  }, [searchParams, router, onYouTubeConnected]);
+  return null;
+}
+
+export default function Home() {
+  const router = useRouter();
 
   // ── Auth state ──
   const [userEmail, setUserEmail] = useState<string>("");
@@ -101,24 +127,6 @@ export default function Home() {
     return () => subscription.unsubscribe();
   }, [router]);
 
-  // Handle ?youtube=connected param — both in popup and in main window
-  useEffect(() => {
-    const param = searchParams.get("youtube");
-    if (param === "connected") {
-      if (window.opener) {
-        // We're in the popup — notify the parent and close
-        window.opener.postMessage("youtube_connected", window.location.origin);
-        window.close();
-      } else {
-        // Fallback: main window redirect (no popup)
-        setYoutubeConnected(true);
-        setYoutubeConnectionChecked(true);
-        // Strip the query param so it doesn't persist on refresh
-        router.replace("/");
-      }
-    }
-  }, [searchParams, router]);
-
   // Listen for postMessage from OAuth popup
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -133,14 +141,6 @@ export default function Home() {
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
   }, []);
-
-  // Check YouTube connection once when a processed video is available
-  useEffect(() => {
-    if ((stage === "done" || pipelineStage === "done") && !youtubeConnectionChecked) {
-      checkYoutubeConnection();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stage, pipelineStage]);
 
   // ── Upload / dead space state ──
   const [file, setFile] = useState<File | null>(null);
@@ -192,6 +192,15 @@ export default function Home() {
   const [hypeStage, setHypeStage] = useState<HypeStage>("idle");
   const [hypeMoments, setHypeMoments] = useState<HypeMoment[]>([]);
   const [hypeErrorMsg, setHypeErrorMsg] = useState<string>("");
+
+  // Check YouTube connection once when a processed video is available
+  // (placed after all state declarations to satisfy the no-use-before-declare rule)
+  useEffect(() => {
+    if ((stage === "done" || pipelineStage === "done") && !youtubeConnectionChecked) {
+      checkYoutubeConnection();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, pipelineStage]);
 
   // ─────────────────────────────────────────────────────────
   // Helpers
@@ -806,6 +815,16 @@ export default function Home() {
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100vh" }}>
+      {/* Handle ?youtube=connected in a Suspense-wrapped leaf so useSearchParams
+          doesn't force the entire page out of static rendering */}
+      <Suspense fallback={null}>
+        <SearchParamsHandler
+          onYouTubeConnected={() => {
+            setYoutubeConnected(true);
+            setYoutubeConnectionChecked(true);
+          }}
+        />
+      </Suspense>
       <TopBar
         userEmail={userEmail}
         onSignOut={handleSignOut}

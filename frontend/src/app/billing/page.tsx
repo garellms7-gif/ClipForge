@@ -129,7 +129,12 @@ export default function BillingPage() {
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100vh" }}>
-      <TopBar userEmail={userEmail} onSignOut={handleSignOut} />
+      <TopBar
+        userEmail={userEmail}
+        onSignOut={handleSignOut}
+        activeTeamId={null}
+        onWorkspaceChange={() => undefined}
+      />
 
       <main
         className="flex flex-col items-center px-4 pt-10 pb-16"
